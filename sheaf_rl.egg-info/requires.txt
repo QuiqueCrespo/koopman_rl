@@ -1,0 +1,8 @@
+numpy>=1.21
+torch>=2.0
+matplotlib>=3.5
+scipy>=1.7
+
+[minigrid]
+gymnasium>=0.27
+minigrid>=2.0

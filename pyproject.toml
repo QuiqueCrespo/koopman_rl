@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sheaf-rl"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=1.21",
+    "torch>=2.0",
+    "matplotlib>=3.5",
+    "scipy>=1.7",
+]
+
+[project.optional-dependencies]
+minigrid = ["gymnasium>=0.27", "minigrid>=2.0"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["sheaf_rl*"]

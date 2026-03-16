@@ -1,0 +1,64 @@
+
+============================================================
+  Ablation run: J1_d16
+  Config overrides: {'D': 16}
+============================================================
+
+====================================================================
+  Ferrari Sheaf-RL v2 — Directed Latent Value Iteration
+  State: (x,y)∈[-1,1]²   GravityBasin   d=32   device=mps
+  Graph: 1024 nodes  |  rebuilt every 500 steps
+  Value iter: 50 directed Bellman steps
+====================================================================
+
+[Warmup: collecting 3000 random transitions...]
+
+
+[Graph built] N=1024 nodes  E_temp=512  k-NN=5  step=3500
+  step   4000  ε=0.905  L_koop=0.2434  L_v=0.0001  L_recon=0.0261  succ/20=1  sps=84  Vd_max=1.000  Vd_μ=0.230
+  step   6000  ε=0.858  L_koop=0.0480  L_v=0.0018  L_recon=0.0034  succ/20=1  sps=58  Vd_max=1.000  Vd_μ=0.310
+  step   8000  ε=0.810  L_koop=0.0065  L_v=0.0002  L_recon=0.0007  succ/20=0  sps=50  Vd_max=1.000  Vd_μ=0.433
+  step  10000  ε=0.762  L_koop=0.0012  L_v=0.0001  L_recon=0.0001  succ/20=0  sps=37  Vd_max=1.000  Vd_μ=0.522
+  step  12000  ε=0.715  L_koop=0.0003  L_v=0.0000  L_recon=0.0000  succ/20=2  sps=45  Vd_max=1.028  Vd_μ=0.529
+  step  14000  ε=0.667  L_koop=0.0002  L_v=0.0000  L_recon=0.0000  succ/20=1  sps=45  Vd_max=1.015  Vd_μ=0.535
+  step  16000  ε=0.620  L_koop=0.0001  L_v=0.0000  L_recon=0.0000  succ/20=2  sps=41  Vd_max=1.014  Vd_μ=0.568
+  step  18000  ε=0.573  L_koop=0.0001  L_v=0.0000  L_recon=0.0000  succ/20=5  sps=34  Vd_max=1.041  Vd_μ=0.629
+  step  20000  ε=0.525  L_koop=0.0001  L_v=0.0000  L_recon=0.0000  succ/20=12  sps=38  Vd_max=1.043  Vd_μ=0.644
+  step  22000  ε=0.478  L_koop=0.0001  L_v=0.0000  L_recon=0.0000  succ/20=19  sps=32  Vd_max=1.021  Vd_μ=0.673
+  step  24000  ε=0.430  L_koop=0.0001  L_v=0.0000  L_recon=0.0000  succ/20=19  sps=47  Vd_max=1.052  Vd_μ=0.676
+  step  26000  ε=0.382  L_koop=0.0001  L_v=0.0000  L_recon=0.0000  succ/20=20  sps=43  Vd_max=1.041  Vd_μ=0.687
+  step  28000  ε=0.335  L_koop=0.0001  L_v=0.0000  L_recon=0.0000  succ/20=20  sps=46  Vd_max=1.043  Vd_μ=0.717
+  step  30000  ε=0.287  L_koop=0.0001  L_v=0.0000  L_recon=0.0000  succ/20=20  sps=44  Vd_max=1.037  Vd_μ=0.706
+  step  32000  ε=0.240  L_koop=0.0001  L_v=0.0000  L_recon=0.0000  succ/20=20  sps=46  Vd_max=1.046  Vd_μ=0.688
+  step  34000  ε=0.193  L_koop=0.0001  L_v=0.0000  L_recon=0.0000  succ/20=20  sps=43  Vd_max=1.045  Vd_μ=0.723
+  step  36000  ε=0.145  L_koop=0.0001  L_v=0.0000  L_recon=0.0000  succ/20=20  sps=49  Vd_max=1.040  Vd_μ=0.745
+  step  38000  ε=0.098  L_koop=0.0001  L_v=0.0000  L_recon=0.0000  succ/20=20  sps=48  Vd_max=1.061  Vd_μ=0.774
+  step  40000  ε=0.050  L_koop=0.0001  L_v=0.0000  L_recon=0.0000  succ/20=20  sps=48  Vd_max=1.040  Vd_μ=0.814
+  step  42000  ε=0.050  L_koop=0.0001  L_v=0.0000  L_recon=0.0000  succ/20=20  sps=45  Vd_max=1.034  Vd_μ=0.762
+  step  44000  ε=0.050  L_koop=0.0001  L_v=0.0000  L_recon=0.0000  succ/20=20  sps=44  Vd_max=1.033  Vd_μ=0.744
+  step  46000  ε=0.050  L_koop=0.0001  L_v=0.0000  L_recon=0.0000  succ/20=20  sps=39  Vd_max=1.038  Vd_μ=0.733
+  step  48000  ε=0.050  L_koop=0.0001  L_v=0.0000  L_recon=0.0000  succ/20=20  sps=40  Vd_max=1.039  Vd_μ=0.760
+  step  50000  ε=0.050  L_koop=0.0001  L_v=0.0000  L_recon=0.0000  succ/20=20  sps=41  Vd_max=1.044  Vd_μ=0.783
+  step  52000  ε=0.050  L_koop=0.0001  L_v=0.0000  L_recon=0.0000  succ/20=20  sps=40  Vd_max=1.052  Vd_μ=0.756
+  step  54000  ε=0.050  L_koop=0.0001  L_v=0.0000  L_recon=0.0000  succ/20=20  sps=38  Vd_max=1.039  Vd_μ=0.721
+  step  56000  ε=0.050  L_koop=0.0001  L_v=0.0000  L_recon=0.0000  succ/20=20  sps=44  Vd_max=1.046  Vd_μ=0.747
+  step  58000  ε=0.050  L_koop=0.0001  L_v=0.0000  L_recon=0.0000  succ/20=20  sps=43  Vd_max=1.047  Vd_μ=0.751
+  step  60000  ε=0.050  L_koop=0.0001  L_v=0.0000  L_recon=0.0000  succ/20=20  sps=37  Vd_max=1.053  Vd_μ=0.776
+  step  62000  ε=0.050  L_koop=0.0000  L_v=0.0000  L_recon=0.0000  succ/20=20  sps=41  Vd_max=1.054  Vd_μ=0.784
+  step  64000  ε=0.050  L_koop=0.0000  L_v=0.0000  L_recon=0.0000  succ/20=20  sps=43  Vd_max=1.063  Vd_μ=0.758
+  step  66000  ε=0.050  L_koop=0.0000  L_v=0.0000  L_recon=0.0000  succ/20=20  sps=40  Vd_max=1.044  Vd_μ=0.719
+  step  68000  ε=0.050  L_koop=0.0000  L_v=0.0000  L_recon=0.0000  succ/20=20  sps=37  Vd_max=1.046  Vd_μ=0.759
+  step  70000  ε=0.050  L_koop=0.0000  L_v=0.0000  L_recon=0.0000  succ/20=20  sps=39  Vd_max=1.047  Vd_μ=0.774
+  step  72000  ε=0.050  L_koop=0.0001  L_v=0.0000  L_recon=0.0000  succ/20=20  sps=41  Vd_max=1.048  Vd_μ=0.774
+  step  74000  ε=0.050  L_koop=0.0001  L_v=0.0000  L_recon=0.0000  succ/20=20  sps=42  Vd_max=1.036  Vd_μ=0.803
+  step  76000  ε=0.050  L_koop=0.0001  L_v=0.0000  L_recon=0.0000  succ/20=20  sps=40  Vd_max=1.043  Vd_μ=0.726
+  step  78000  ε=0.050  L_koop=0.0001  L_v=0.0000  L_recon=0.0000  succ/20=20  sps=41  Vd_max=1.040  Vd_μ=0.776
+  step  80000  ε=0.050  L_koop=0.0001  L_v=0.0000  L_recon=0.0000  succ/20=20  sps=39  Vd_max=1.057  Vd_μ=0.789
+  step  82000  ε=0.050  L_koop=0.0001  L_v=0.0000  L_recon=0.0000  succ/20=20  sps=39  Vd_max=1.036  Vd_μ=0.774
+  step  84000  ε=0.050  L_koop=0.0000  L_v=0.0000  L_recon=0.0000  succ/20=20  sps=44  Vd_max=1.054  Vd_μ=0.763
+  step  86000  ε=0.050  L_koop=0.0000  L_v=0.0000  L_recon=0.0000  succ/20=20  sps=42  Vd_max=1.048  Vd_μ=0.787
+  step  88000  ε=0.050  L_koop=0.0000  L_v=0.0000  L_recon=0.0000  succ/20=20  sps=39  Vd_max=1.047  Vd_μ=0.799
+  step  90000  ε=0.050  L_koop=0.0000  L_v=0.0000  L_recon=0.0000  succ/20=20  sps=38  Vd_max=1.039  Vd_μ=0.767
+  step  92000  ε=0.050  L_koop=0.0000  L_v=0.0000  L_recon=0.0000  succ/20=20  sps=42  Vd_max=1.047  Vd_μ=0.764
+  step  94000  ε=0.050  L_koop=0.0000  L_v=0.0000  L_recon=0.0000  succ/20=20  sps=50  Vd_max=1.046  Vd_μ=0.820
+  step  96000  ε=0.050  L_koop=0.0001  L_v=0.0000  L_recon=0.0000  succ/20=20  sps=54  Vd_max=1.050  Vd_μ=0.811

@@ -1,0 +1,19 @@
+=== Planner comparison (horizon=10, plan_iters=20, 50 ep each) ===
+
+  [greedy] evaluating 50 episodes...
+
+  [softmax] evaluating 50 episodes...
+
+  [softmax_cumul] evaluating 50 episodes...
+
+  [shooting_200] evaluating 50 episodes...
+
+  [beam_8] evaluating 50 episodes...
+  greedy            : 50/50  mean_return=0.799
+  softmax           : 1/50  mean_return=-1.940
+  softmax_cumul     : 50/50  mean_return=0.813
+  shooting_200      : 45/50  mean_return=0.444
+  beam_8            : 50/50  mean_return=0.737
+
+Saved → planner_comparison.png
+Done.

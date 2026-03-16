@@ -1,0 +1,11 @@
+Metadata-Version: 2.4
+Name: sheaf-rl
+Version: 0.1.0
+Requires-Python: >=3.11
+Requires-Dist: numpy>=1.21
+Requires-Dist: torch>=2.0
+Requires-Dist: matplotlib>=3.5
+Requires-Dist: scipy>=1.7
+Provides-Extra: minigrid
+Requires-Dist: gymnasium>=0.27; extra == "minigrid"
+Requires-Dist: minigrid>=2.0; extra == "minigrid"

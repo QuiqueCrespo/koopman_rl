@@ -1,0 +1,69 @@
+
+============================================================
+  Ablation run: A1_no_graph
+  Config overrides: {'NO_GRAPH': True}
+============================================================
+
+====================================================================
+  Ferrari Sheaf-RL v2 — Directed Latent Value Iteration
+  State: (x,y)∈[-1,1]²   GravityBasin   d=32   device=mps
+  Graph: 1024 nodes  |  rebuilt every 500 steps
+  Value iter: 50 directed Bellman steps
+====================================================================
+
+[Warmup: collecting 3000 random transitions...]
+
+  step   4000  ε=0.905  L_koop=0.1838  L_v=0.0000  L_recon=0.0175  succ/20=0  sps=214  Vd_max=nan  Vd_μ=nan
+  step   6000  ε=0.858  L_koop=0.0260  L_v=0.0001  L_recon=0.0028  succ/20=1  sps=129  Vd_max=nan  Vd_μ=nan
+  step   8000  ε=0.810  L_koop=0.0015  L_v=0.0002  L_recon=0.0002  succ/20=1  sps=126  Vd_max=nan  Vd_μ=nan
+  step  10000  ε=0.762  L_koop=0.0006  L_v=0.0004  L_recon=0.0000  succ/20=1  sps=128  Vd_max=nan  Vd_μ=nan
+  step  12000  ε=0.715  L_koop=0.0003  L_v=0.0007  L_recon=0.0000  succ/20=4  sps=130  Vd_max=nan  Vd_μ=nan
+  step  14000  ε=0.667  L_koop=0.0002  L_v=0.0010  L_recon=0.0000  succ/20=7  sps=126  Vd_max=nan  Vd_μ=nan
+  step  16000  ε=0.620  L_koop=0.0002  L_v=0.0013  L_recon=0.0000  succ/20=10  sps=127  Vd_max=nan  Vd_μ=nan
+  step  18000  ε=0.573  L_koop=0.0002  L_v=0.0015  L_recon=0.0000  succ/20=15  sps=123  Vd_max=nan  Vd_μ=nan
+  step  20000  ε=0.525  L_koop=0.0002  L_v=0.0016  L_recon=0.0000  succ/20=18  sps=121  Vd_max=nan  Vd_μ=nan
+  step  22000  ε=0.478  L_koop=0.0002  L_v=0.0016  L_recon=0.0000  succ/20=18  sps=119  Vd_max=nan  Vd_μ=nan
+  step  24000  ε=0.430  L_koop=0.0002  L_v=0.0015  L_recon=0.0000  succ/20=20  sps=121  Vd_max=nan  Vd_μ=nan
+  step  26000  ε=0.382  L_koop=0.0002  L_v=0.0014  L_recon=0.0000  succ/20=20  sps=118  Vd_max=nan  Vd_μ=nan
+  step  28000  ε=0.335  L_koop=0.0002  L_v=0.0014  L_recon=0.0000  succ/20=20  sps=115  Vd_max=nan  Vd_μ=nan
+  step  30000  ε=0.287  L_koop=0.0002  L_v=0.0013  L_recon=0.0000  succ/20=20  sps=111  Vd_max=nan  Vd_μ=nan
+  step  32000  ε=0.240  L_koop=0.0002  L_v=0.0013  L_recon=0.0000  succ/20=20  sps=115  Vd_max=nan  Vd_μ=nan
+  step  34000  ε=0.193  L_koop=0.0002  L_v=0.0012  L_recon=0.0000  succ/20=20  sps=109  Vd_max=nan  Vd_μ=nan
+  step  36000  ε=0.145  L_koop=0.0002  L_v=0.0012  L_recon=0.0000  succ/20=20  sps=112  Vd_max=nan  Vd_μ=nan
+  step  38000  ε=0.098  L_koop=0.0003  L_v=0.0011  L_recon=0.0000  succ/20=20  sps=110  Vd_max=nan  Vd_μ=nan
+  step  40000  ε=0.050  L_koop=0.0003  L_v=0.0010  L_recon=0.0000  succ/20=20  sps=109  Vd_max=nan  Vd_μ=nan
+  step  42000  ε=0.050  L_koop=0.0002  L_v=0.0009  L_recon=0.0000  succ/20=20  sps=107  Vd_max=nan  Vd_μ=nan
+  step  44000  ε=0.050  L_koop=0.0002  L_v=0.0009  L_recon=0.0000  succ/20=20  sps=109  Vd_max=nan  Vd_μ=nan
+  step  46000  ε=0.050  L_koop=0.0002  L_v=0.0009  L_recon=0.0000  succ/20=20  sps=108  Vd_max=nan  Vd_μ=nan
+  step  48000  ε=0.050  L_koop=0.0002  L_v=0.0008  L_recon=0.0000  succ/20=20  sps=108  Vd_max=nan  Vd_μ=nan
+  step  50000  ε=0.050  L_koop=0.0002  L_v=0.0008  L_recon=0.0000  succ/20=19  sps=110  Vd_max=nan  Vd_μ=nan
+  step  52000  ε=0.050  L_koop=0.0002  L_v=0.0010  L_recon=0.0000  succ/20=20  sps=108  Vd_max=nan  Vd_μ=nan
+  step  54000  ε=0.050  L_koop=0.0002  L_v=0.0012  L_recon=0.0000  succ/20=20  sps=106  Vd_max=nan  Vd_μ=nan
+  step  56000  ε=0.050  L_koop=0.0002  L_v=0.0013  L_recon=0.0000  succ/20=20  sps=107  Vd_max=nan  Vd_μ=nan
+  step  58000  ε=0.050  L_koop=0.0002  L_v=0.0015  L_recon=0.0000  succ/20=20  sps=104  Vd_max=nan  Vd_μ=nan
+  step  60000  ε=0.050  L_koop=0.0002  L_v=0.0017  L_recon=0.0000  succ/20=20  sps=107  Vd_max=nan  Vd_μ=nan
+  step  62000  ε=0.050  L_koop=0.0002  L_v=0.0019  L_recon=0.0000  succ/20=20  sps=108  Vd_max=nan  Vd_μ=nan
+  step  64000  ε=0.050  L_koop=0.0002  L_v=0.0020  L_recon=0.0000  succ/20=18  sps=108  Vd_max=nan  Vd_μ=nan
+  step  66000  ε=0.050  L_koop=0.0002  L_v=0.0021  L_recon=0.0000  succ/20=18  sps=107  Vd_max=nan  Vd_μ=nan
+  step  68000  ε=0.050  L_koop=0.0002  L_v=0.0023  L_recon=0.0000  succ/20=20  sps=105  Vd_max=nan  Vd_μ=nan
+  step  70000  ε=0.050  L_koop=0.0002  L_v=0.0025  L_recon=0.0000  succ/20=19  sps=109  Vd_max=nan  Vd_μ=nan
+  step  72000  ε=0.050  L_koop=0.0002  L_v=0.0026  L_recon=0.0000  succ/20=20  sps=108  Vd_max=nan  Vd_μ=nan
+  step  74000  ε=0.050  L_koop=0.0003  L_v=0.0027  L_recon=0.0000  succ/20=20  sps=108  Vd_max=nan  Vd_μ=nan
+  step  76000  ε=0.050  L_koop=0.0003  L_v=0.0028  L_recon=0.0000  succ/20=20  sps=103  Vd_max=nan  Vd_μ=nan
+  step  78000  ε=0.050  L_koop=0.0003  L_v=0.0029  L_recon=0.0000  succ/20=20  sps=108  Vd_max=nan  Vd_μ=nan
+  step  80000  ε=0.050  L_koop=0.0003  L_v=0.0030  L_recon=0.0000  succ/20=19  sps=108  Vd_max=nan  Vd_μ=nan
+  step  82000  ε=0.050  L_koop=0.0003  L_v=0.0031  L_recon=0.0000  succ/20=17  sps=109  Vd_max=nan  Vd_μ=nan
+  step  84000  ε=0.050  L_koop=0.0003  L_v=0.0034  L_recon=0.0000  succ/20=18  sps=107  Vd_max=nan  Vd_μ=nan
+  step  86000  ε=0.050  L_koop=0.0003  L_v=0.0035  L_recon=0.0000  succ/20=18  sps=109  Vd_max=nan  Vd_μ=nan
+  step  88000  ε=0.050  L_koop=0.0003  L_v=0.0037  L_recon=0.0000  succ/20=19  sps=110  Vd_max=nan  Vd_μ=nan
+  step  90000  ε=0.050  L_koop=0.0003  L_v=0.0039  L_recon=0.0000  succ/20=14  sps=106  Vd_max=nan  Vd_μ=nan
+  step  92000  ε=0.050  L_koop=0.0003  L_v=0.0042  L_recon=0.0000  succ/20=14  sps=108  Vd_max=nan  Vd_μ=nan
+  step  94000  ε=0.050  L_koop=0.0004  L_v=0.0044  L_recon=0.0000  succ/20=14  sps=108  Vd_max=nan  Vd_μ=nan
+  step  96000  ε=0.050  L_koop=0.0004  L_v=0.0047  L_recon=0.0000  succ/20=17  sps=109  Vd_max=nan  Vd_μ=nan
+  step  98000  ε=0.050  L_koop=0.0004  L_v=0.0048  L_recon=0.0000  succ/20=16  sps=106  Vd_max=nan  Vd_μ=nan
+  step 100000  ε=0.050  L_koop=0.0004  L_v=0.0049  L_recon=0.0000  succ/20=19  sps=105  Vd_max=nan  Vd_μ=nan
+
+Greedy evaluation (100 ep): success=64.0%  mean_steps=25.1
+
+Saved → ablation_results/A1_no_graph.json
+  succ_final=19/20  succ_50k=20/20  greedy=64.0%

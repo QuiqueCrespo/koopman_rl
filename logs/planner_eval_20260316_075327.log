@@ -1,0 +1,20 @@
+import torch, torch.nn as nn, numpy as np, random, types
+from model import SheafAgent, D
+from env import STATE_DIM
+from gravity_basin import evaluate
+from sheaf_rl_directed import evaluate_planner, plot_planner_comparison
+
+torch.manual_seed(42); np.random.seed(42); random.seed(42)
+
+agent = SheafAgent()
+agent.decoder = nn.Linear(D, STATE_DIM)
+agent.load_state_dict(torch.load("ablation_results/BASE_model.pt", map_location="cpu"))
+agent.eval()
+agent.act = types.MethodType(agent.__class__.act, agent)
+
+print("=== Planner comparison (horizon=10, plan_iters=20, 50 episodes each) ===")
+results = evaluate_planner(agent, n_episodes=50, horizon=10, plan_iters=20)
+for mode, vals in results.items():
+    succ = sum(v > 0 for v in vals)
+    print(f"  {mode:18s}: {succ}/50  mean_return={np.mean(vals):.3f}")
+plot_planner_comparison(results)
