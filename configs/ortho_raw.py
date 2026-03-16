@@ -1,0 +1,13 @@
+"""ortho_a + no normalization anywhere (raw encoder output), 100k steps."""
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from sheaf_rl.config import Config, TrainConfig, ModelConfig, AlgoConfig
+
+cfg = Config(
+    run_name="ortho_raw",
+    model=ModelConfig(ortho_a=True),
+    algo=AlgoConfig(no_normalize=True),
+    train=TrainConfig(n_steps=100_000, warmup=20_000, log_every=5_000, plot_every=5_000,
+                      eps_end=0.15, eps_decay=70_000),
+)

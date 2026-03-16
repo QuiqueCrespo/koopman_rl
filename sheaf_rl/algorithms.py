@@ -6,6 +6,7 @@ Contains:
   build_and_propagate       — graph construction + VI
   train                     — full training loop (accepts Config or legacy dict)
   evaluate                  — greedy rollout evaluation
+  evaluate_planner          — comparison of all planner variants
 """
 
 import numpy as np
@@ -17,7 +18,7 @@ import time
 
 from sheaf_rl.config import Config
 from sheaf_rl.env import GravityBasin
-from sheaf_rl.model import SheafAgent, TargetNetwork
+from sheaf_rl.model import KoopmanGradientPlanner, TargetNetwork
 from sheaf_rl.buffer import ReplayBuffer
 
 
@@ -89,7 +90,7 @@ def directed_value_iteration(
 # ---------------------------------------------------------------------------
 
 def build_and_propagate(
-    agent:  SheafAgent,
+    agent:  KoopmanGradientPlanner,
     target: TargetNetwork,
     buf:    ReplayBuffer,
     cfg:    Config,
@@ -220,18 +221,17 @@ def train(cfg=None) -> dict:
 
     env    = GravityBasin(cfg.env)
     buf    = ReplayBuffer.from_cfg(cfg)
-    agent  = SheafAgent.from_cfg(cfg)
-    target = TargetNetwork(agent)
+    agent  = KoopmanGradientPlanner.from_cfg(cfg)
 
-    # Linear decoder for reconstruction anchor — prevents encoder collapse.
-    agent.decoder = nn.Linear(m.d, cfg.env.state_dim)
     if a.no_normalize:
         agent.encoder.no_normalize = True
+
+    target = TargetNetwork(agent)   # deepcopy inherits no_normalize if set
 
     neural_params = (list(agent.encoder.parameters()) +
                      list(agent.v_net.parameters()) +
                      list(agent.decoder.parameters()))
-    koop_params   = [agent.B] if a.fix_a else [agent.A, agent.B]
+    koop_params   = [agent.B] if a.fix_a else agent.koop_parameters()
     opt = optim.Adam([
         {"params": neural_params, "lr": m.lr},
         {"params": koop_params,   "lr": m.lr * KOOP_LR_SCALE, "weight_decay": KOOP_WD},
@@ -313,8 +313,8 @@ def train(cfg=None) -> dict:
         with torch.no_grad():
             z_dst_tgt = target.encoder(ns_b)
 
-        # Loss 1 — Koopman: || normalize(A z + b_a) − z_{t+1}_target ||²
-        z_pred    = F.normalize(z_src @ agent.A.T + agent.B.T[a_b], dim=-1)
+        # Loss 1 — Koopman: || dyn_step(z, b_a) − z_{t+1}_target ||²
+        z_pred    = agent.dyn_step(z_src, agent.B.T[a_b])
         koop_mask = 1.0 - d_b
         L_koop    = ((z_pred - z_dst_tgt.detach()).pow(2)
                       .sum(dim=-1).mul(koop_mask)).mean()
@@ -325,11 +325,15 @@ def train(cfg=None) -> dict:
         # Loss 3a — Local 1-step Double TD (safety net)
         with torch.no_grad():
             z_A_next   = z_dst_tgt @ agent.A.detach().T
-            B_cols     = agent.B.detach().T
-            z_next_all = F.normalize(
-                z_A_next.unsqueeze(1) + B_cols.unsqueeze(0), dim=-1
-            )
-            Bs, A_size, d_dim = z_next_all.shape
+            B_cols     = agent.B.detach().T                         # [n_actions, d]
+            raw_next   = z_A_next.unsqueeze(1) + B_cols.unsqueeze(0)  # [Bs, A, d]
+            Bs, A_size, d_dim = raw_next.shape
+            if agent._ortho_a:
+                z_next_all = raw_next
+            else:
+                z_next_all = F.normalize(
+                    raw_next.reshape(Bs * A_size, d_dim), dim=-1
+                ).reshape(Bs, A_size, d_dim)
             v_all      = agent.v_net(z_next_all.reshape(Bs * A_size, d_dim)).reshape(Bs, A_size)
             best_a_idx = v_all.argmax(dim=1)
             v_tgt      = target.v_net(z_next_all.reshape(Bs * A_size, d_dim)).reshape(Bs, A_size)
@@ -439,19 +443,31 @@ def evaluate(agent, cfg=None, n_episodes: int = 100) -> tuple:
 
 def evaluate_planner(agent, cfg=None, n_episodes: int = 100,
                      horizon: int = 10, plan_iters: int = 20) -> dict:
-    """Greedy vs softmax-gradient vs shooting vs beam-search."""
-    from planner import (plan_action_softmax, plan_action_softmax_cumulative,
-                         plan_action_shooting, plan_action_beam)
+    """Compare all planner variants: greedy, gumbel, softmax, shooting, beam."""
+    from sheaf_rl.planner import (
+        plan_action_gumbel, plan_action_gumbel_cumulative,
+        plan_action_softmax, plan_action_softmax_cumulative,
+        plan_action_shooting, plan_action_beam,
+    )
     from sheaf_rl.env import GravityBasin
 
     env       = GravityBasin(cfg.env if cfg else None)
     max_steps = env.max_ep_steps
 
-    results = {"greedy": [], "softmax": [], "softmax_cumul": [],
-               "shooting_200": [], "beam_8": []}
+    results = {
+        "greedy":       [],
+        "gumbel":       [],
+        "gumbel_cumul": [],
+        "softmax":      [],
+        "softmax_cumul":[],
+        "shooting_200": [],
+        "beam_8":       [],
+    }
 
     for mode, act_fn in [
         ("greedy",        lambda s: agent.act(s, epsilon=0.0)),
+        ("gumbel",        lambda s: plan_action_gumbel(agent, s, horizon, plan_iters)),
+        ("gumbel_cumul",  lambda s: plan_action_gumbel_cumulative(agent, s, horizon, plan_iters)),
         ("softmax",       lambda s: plan_action_softmax(agent, s, horizon, plan_iters)),
         ("softmax_cumul", lambda s: plan_action_softmax_cumulative(agent, s, horizon, plan_iters)),
         ("shooting_200",  lambda s: plan_action_shooting(agent, s, horizon, n_samples=200)),

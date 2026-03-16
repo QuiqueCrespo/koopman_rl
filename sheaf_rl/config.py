@@ -21,9 +21,11 @@ class EnvConfig:
 
 @dataclass
 class ModelConfig:
-    d:       int   = 32       # latent dimension
-    lr:      float = 3e-4
-    ema_tau: float = 0.005
+    d:         int   = 32       # latent dimension
+    lr:        float = 3e-4
+    ema_tau:   float = 0.005
+    ortho_a:   bool  = False    # constrain A ∈ O(d) via SVD parametrization (fully linear)
+    tanh_out:  bool  = False    # tanh final encoder layer instead of L2 norm
 
 
 @dataclass
@@ -49,16 +51,27 @@ class AlgoConfig:
     k_diffuse:           int   = 50
     stratified:          bool  = True
     # Ablation switches
-    no_graph:            bool  = False
+    no_graph:            bool  = True
     td_plus_vi:          bool  = False
     fix_a:               bool  = False
     no_normalize:        bool  = False
+    lambda_ortho:        float = 1.0   # weight of soft ||AᵀA − I||²_F penalty (ortho_a=True only)
+
+
+@dataclass
+class PlannerConfig:
+    horizon:    int   = 10
+    plan_iters: int   = 20
+    lr:         float = 0.1
+    tau:        float = 1.0    # Gumbel temperature (lower → more discrete / sharper)
+    n_samples:  int   = 200    # random shooting
+    beam_width: int   = 8      # beam search
 
 
 @dataclass
 class TrainConfig:
     n_steps:    int   = 100_000
-    warmup:     int   = 3_000
+    warmup:     int   = 20_000
     eps_start:  float = 1.0
     eps_end:    float = 0.05
     eps_decay:  int   = 40_000
@@ -68,14 +81,15 @@ class TrainConfig:
 
 @dataclass
 class Config:
-    env:      EnvConfig    = field(default_factory=EnvConfig)
-    model:    ModelConfig  = field(default_factory=ModelConfig)
-    buffer:   BufferConfig = field(default_factory=BufferConfig)
-    algo:     AlgoConfig   = field(default_factory=AlgoConfig)
-    train:    TrainConfig  = field(default_factory=TrainConfig)
-    run_name: str          = "unnamed"
-    seed:     int          = 42
-    device:   str          = "auto"   # "auto" | "cpu" | "cuda" | "mps"
+    env:      EnvConfig     = field(default_factory=EnvConfig)
+    model:    ModelConfig   = field(default_factory=ModelConfig)
+    buffer:   BufferConfig  = field(default_factory=BufferConfig)
+    algo:     AlgoConfig    = field(default_factory=AlgoConfig)
+    train:    TrainConfig   = field(default_factory=TrainConfig)
+    planner:  PlannerConfig = field(default_factory=PlannerConfig)
+    run_name: str           = "unnamed"
+    seed:     int           = 42
+    device:   str           = "auto"   # "auto" | "cpu" | "cuda" | "mps"
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -93,6 +107,7 @@ class Config:
             buffer=BufferConfig(**d.get("buffer", {})),
             algo=AlgoConfig(**d.get("algo", {})),
             train=TrainConfig(**d.get("train", {})),
+            planner=PlannerConfig(**d.get("planner", {})),
             run_name=d.get("run_name", "unnamed"),
             seed=d.get("seed", 42),
             device=d.get("device", "auto"),
@@ -116,7 +131,9 @@ class Config:
             "TD_PLUS_VI":          ("algo", "td_plus_vi"),
             "FIX_A":               ("algo", "fix_a"),
             "NO_NORMALIZE":        ("algo", "no_normalize"),
+            "LAMBDA_ORTHO":        ("algo", "lambda_ortho"),
             "D":                   ("model", "d"),
+            "ORTHO_A":             ("model", "ortho_a"),
         }
         cfg = cls()
         for k, v in overrides.items():

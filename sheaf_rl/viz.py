@@ -178,7 +178,8 @@ def visualize_graph(graph_data: dict, step: int, cfg=None) -> None:
                   f"|  penalty={bisim_penalty}×dist")
 
     plt.tight_layout()
-    plt.savefig("sheaf_graph_live.png", dpi=130, bbox_inches="tight")
+    run = cfg.run_name if cfg else "run"
+    plt.savefig(f"{run}_graph_live.png", dpi=130, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -259,7 +260,7 @@ def plot_live(
         ax.scatter(proj[:, 0], proj[:, 1], c="lightgray", s=10, zorder=2)
         for a in range(n_a):
             with torch.no_grad():
-                Z_next = F.normalize(Z @ agent.A.T + agent.B[:, a], dim=-1).numpy()
+                Z_next = agent.dyn_step(Z, agent.B[:, a]).numpy()
             pn = (Z_next - Z_np.mean(axis=0)) @ Vt[:2].T
             ax.quiver(proj[:, 0], proj[:, 1],
                       pn[:, 0] - proj[:, 0], pn[:, 1] - proj[:, 1],
@@ -273,8 +274,9 @@ def plot_live(
     ax.set_title("Linear Dynamics (PCA-2D)")
     ax.set_xlabel("PC$_1$"); ax.set_ylabel("PC$_2$")
 
+    run = cfg.run_name if cfg else "run"
     plt.tight_layout()
-    plt.savefig("sheaf_rl_live.png", dpi=120)
+    plt.savefig(f"{run}_live.png", dpi=120)
     plt.close(fig)
     agent.to(device)
 
@@ -336,7 +338,7 @@ def plot_results(history: dict, cfg=None) -> None:
     ax.scatter(proj[:, 0], proj[:, 1], c="lightgray", s=12, zorder=2, label=r"$z_s$")
     for a in range(n_a):
         with torch.no_grad():
-            Z_next = F.normalize(Z @ agent.A.T + agent.B[:, a], dim=-1)
+            Z_next = agent.dyn_step(Z, agent.B[:, a])
         proj_n = (Z_next.numpy() - Z_np.mean(axis=0)) @ Vt[:2].T
         ax.quiver(proj[:, 0], proj[:, 1],
                   proj_n[:, 0] - proj[:, 0], proj_n[:, 1] - proj[:, 1],
@@ -348,9 +350,10 @@ def plot_results(history: dict, cfg=None) -> None:
                  r"Arrows: $\mathrm{normalize}(Az + Be_a) \to$ predicted $z_{t+1}$")
     ax.set_xlabel("PC$_1$"); ax.set_ylabel("PC$_2$")
 
+    run = cfg.run_name if cfg else "run"
     plt.tight_layout()
-    plt.savefig("sheaf_rl_directed_results.png", dpi=150)
-    print("\nSaved -> sheaf_rl_directed_results.png")
+    plt.savefig(f"{run}_results.png", dpi=150)
+    print(f"\nSaved -> {run}_results.png")
     plt.show()
 
 
