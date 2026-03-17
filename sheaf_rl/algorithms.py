@@ -214,6 +214,7 @@ def train(cfg=None) -> dict:
     LAMBDA_KOOP    = a.lambda_koop
     LAMBDA_BISIM   = 0.0   # bisim is disabled in directed VI (uses bisim graph edges instead)
     LAMBDA_RECON   = a.lambda_recon
+    LAMBDA_ORTHO   = a.lambda_ortho
     LAMBDA_V       = a.lambda_v
     KOOP_LR_SCALE  = a.koop_lr_scale
     KOOP_WD        = 0.0
@@ -221,7 +222,7 @@ def train(cfg=None) -> dict:
 
     env    = GravityBasin(cfg.env)
     buf    = ReplayBuffer.from_cfg(cfg)
-    agent  = KoopmanGradientPlanner.from_cfg(cfg)
+    agent  = KoopmanGradientPlanner.from_cfg(cfg, device=device)
 
     if a.no_normalize:
         agent.encoder.no_normalize = True
@@ -358,7 +359,14 @@ def train(cfg=None) -> dict:
 
         L_bisim = torch.tensor(0.0, device=device)
 
-        loss = LAMBDA_KOOP * L_koop + LAMBDA_V * L_v + LAMBDA_BISIM * L_bisim + LAMBDA_RECON * L_recon
+        # Soft ortho penalty — only when hard SVD constraint is not active (MPS/CPU).
+        if m.ortho_a and not agent._use_hard_ortho:
+            L_ortho = agent.ortho_penalty()
+        else:
+            L_ortho = torch.tensor(0.0, device=device)
+
+        loss = (LAMBDA_KOOP * L_koop + LAMBDA_V * L_v + LAMBDA_BISIM * L_bisim
+                + LAMBDA_RECON * L_recon + LAMBDA_ORTHO * L_ortho)
         opt.zero_grad()
         loss.backward()
         nn.utils.clip_grad_norm_(agent.parameters(), max_norm=10.0)
@@ -448,6 +456,7 @@ def evaluate_planner(agent, cfg=None, n_episodes: int = 100,
         plan_action_gumbel, plan_action_gumbel_cumulative,
         plan_action_softmax, plan_action_softmax_cumulative,
         plan_action_shooting, plan_action_beam,
+        plan_action_toeplitz,
     )
     from sheaf_rl.env import GravityBasin
 
@@ -455,13 +464,14 @@ def evaluate_planner(agent, cfg=None, n_episodes: int = 100,
     max_steps = env.max_ep_steps
 
     results = {
-        "greedy":       [],
-        "gumbel":       [],
-        "gumbel_cumul": [],
-        "softmax":      [],
-        "softmax_cumul":[],
-        "shooting_200": [],
-        "beam_8":       [],
+        "greedy":        [],
+        "gumbel":        [],
+        "gumbel_cumul":  [],
+        "softmax":       [],
+        "softmax_cumul": [],
+        "shooting_200":  [],
+        "beam_8":        [],
+        "toeplitz":      [],
     }
 
     for mode, act_fn in [
@@ -472,6 +482,7 @@ def evaluate_planner(agent, cfg=None, n_episodes: int = 100,
         ("softmax_cumul", lambda s: plan_action_softmax_cumulative(agent, s, horizon, plan_iters)),
         ("shooting_200",  lambda s: plan_action_shooting(agent, s, horizon, n_samples=200)),
         ("beam_8",        lambda s: plan_action_beam(agent, s, horizon, beam_width=8)),
+        ("toeplitz",      lambda s: plan_action_toeplitz(agent, s, horizon, plan_iters)),
     ]:
         print(f"\n  [{mode}] evaluating {n_episodes} episodes...", flush=True)
         for _ in range(n_episodes):

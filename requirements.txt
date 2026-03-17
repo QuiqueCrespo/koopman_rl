@@ -2,3 +2,4 @@ numpy>=1.21
 torch>=2.0
 matplotlib>=3.5
 scipy>=1.7
+gymnasium[classic-control]>=1.0

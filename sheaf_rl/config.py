@@ -21,11 +21,11 @@ class EnvConfig:
 
 @dataclass
 class ModelConfig:
-    d:         int   = 32       # latent dimension
-    lr:        float = 3e-4
-    ema_tau:   float = 0.005
-    ortho_a:   bool  = False    # constrain A ∈ O(d) via SVD parametrization (fully linear)
-    tanh_out:  bool  = False    # tanh final encoder layer instead of L2 norm
+    d:        int   = 32       # latent dimension
+    lr:       float = 3e-4
+    ema_tau:  float = 0.005
+    ortho_a:  bool  = False    # constrain A ∈ O(d) via SVD Procrustes (CUDA) / soft penalty (MPS/CPU)
+    tanh_out: bool  = False    # tanh final encoder layer instead of L2 norm
 
 
 @dataclass

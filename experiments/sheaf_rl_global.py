@@ -25,6 +25,8 @@ import torch.nn.functional as F
 import torch.optim as optim
 import random
 import time
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from gravity_basin import (
@@ -1110,7 +1112,7 @@ def plot_results(history: dict) -> None:
     plt.tight_layout()
     plt.savefig("sheaf_rl_global_results.png", dpi=150)
     print("\nSaved -> sheaf_rl_global_results.png")
-    plt.show()
+    plt.close()
 
 
 # ---------------------------------------------------------------------------

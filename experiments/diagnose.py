@@ -18,6 +18,8 @@ Usage:
 import numpy as np
 import torch
 import torch.nn.functional as F
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 from dataclasses import dataclass, field
@@ -449,7 +451,7 @@ class DiagnosticHook:
 
         plt.savefig(save_path, dpi=dpi, bbox_inches="tight")
         print(f"\nSaved → {save_path}")
-        plt.show()
+        plt.close()
 
     # ------------------------------------------------------------------
     # Leading indicator analysis

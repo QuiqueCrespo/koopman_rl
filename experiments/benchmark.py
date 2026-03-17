@@ -23,6 +23,8 @@ import torch.nn as nn
 import torch.optim as optim
 import random
 import copy
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 # Reuse environment and network components from the Sheaf-RL implementation
@@ -261,7 +263,7 @@ def plot_comparison(sheaf_hist: dict, dqn_hist: dict) -> None:
     plt.tight_layout()
     plt.savefig("benchmark_results.png", dpi=150)
     print("\nSaved → benchmark_results.png")
-    plt.show()
+    plt.close()
 
 
 # ---------------------------------------------------------------------------

@@ -13,7 +13,13 @@ Visualizations produced (saved to ./viz_pendulum/):
 Success criterion: episode returns consistently above -300 in 20k steps.
 """
 
+import argparse
 import os
+import sys
+import time
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -57,6 +63,10 @@ VIZ_PLAN_ITERS   = 50    # more iters for viz (offline, no speed pressure)
 REWARD_SCALE     = 10.0  # divide rewards before TD: keeps V in [-150, 0] range
 VIZ_EVERY        = 5_000 # dashboard + filmstrip interval
 VIZ_DIR          = "viz_pendulum"
+
+# Discrete-action Toeplitz test
+N_DISC_ACTIONS = 9   # torque levels uniformly spaced in [-ACTION_SCALE, ACTION_SCALE]
+N_EVAL_PLAN    = 20  # episodes per planner in the speed/quality benchmark
 
 os.makedirs(VIZ_DIR, exist_ok=True)
 
@@ -168,6 +178,45 @@ def _value_grid(agent, n_theta=60, n_tdot=50):
 
     V_grid = v.reshape(n_tdot, n_theta)
     return theta_vals, tdot_vals, V_grid
+
+
+def _decode_plan_rollout_dyn(agent, start_state: np.ndarray,
+                             horizon: int = 15, plan_iters: int = 30, lr: float = 0.05):
+    """
+    Like _decode_plan_rollout but uses agent.dyn_step — works for both
+    ortho_a=True (linear, no normalise) and ortho_a=False (normalised sphere).
+    """
+    device = next(agent.parameters()).device
+    with torch.no_grad():
+        z0 = agent.encoder(
+            torch.tensor(start_state, dtype=torch.float32).unsqueeze(0).to(device)
+        )
+
+    u_logits = torch.zeros(horizon, ACTION_DIM, device=device, requires_grad=True)
+    opt_p = optim.Adam([u_logits], lr=lr)
+
+    for _ in range(plan_iters):
+        opt_p.zero_grad()
+        z_t = z0
+        u   = torch.tanh(u_logits)
+        for t in range(horizon):
+            z_t = agent.dyn_step(z_t, (agent.B @ u[t]).unsqueeze(0))
+        loss = -agent.v_net(z_t).mean()
+        (g,) = torch.autograd.grad(loss, u_logits, only_inputs=True)
+        u_logits.grad = g
+        opt_p.step()
+
+    with torch.no_grad():
+        u_opt = torch.tanh(u_logits)
+        zs, z_t = [z0], z0
+        for t in range(horizon):
+            z_t = agent.dyn_step(z_t, (agent.B @ u_opt[t]).unsqueeze(0))
+            zs.append(z_t)
+        decoded   = agent.decoder(torch.cat(zs, dim=0)).cpu().numpy()
+        thetas    = np.arctan2(decoded[:, 1], decoded[:, 0])
+        thetadots = decoded[:, 2]
+        actions   = (u_opt * ACTION_SCALE).cpu().numpy().flatten()
+    return thetas, thetadots, actions
 
 
 def _decode_plan_rollout(agent, start_state: np.ndarray,
@@ -487,19 +536,15 @@ def plot_final_summary(agent, episode_returns, buf):
     ax.imshow(V_grid, extent=[-np.pi, np.pi, -8, 8],
               aspect="auto", origin="lower", cmap="plasma", alpha=0.55)
     hang_state = np.array([-1.0, 0.0, 0.0], dtype=np.float32)  # θ = π
+    _plan_rollout = _decode_plan_rollout_dyn if agent._ortho_a else _decode_plan_rollout
     try:
-        th_p, td_p, acts = _decode_plan_rollout(agent, hang_state,
-                                                horizon=VIZ_PLAN_HORIZON, plan_iters=VIZ_PLAN_ITERS)
+        th_p, td_p, acts = _plan_rollout(agent, hang_state,
+                                         horizon=VIZ_PLAN_HORIZON, plan_iters=VIZ_PLAN_ITERS)
         _colorline(ax, th_p, td_p, cmap="Oranges", lw=2.5)
         ax.plot(th_p[0], td_p[0], "o", color="#ff7f0e", ms=7, zorder=5,
                 label="plan start")
         ax.plot(th_p[-1], td_p[-1], "*", color="#ff7f0e", ms=9, zorder=5,
                 label="plan end")
-    except Exception:
-        pass
-    try:
-        # Also run actual env from same state (if we could set Pendulum state)
-        pass
     except Exception:
         pass
     ax.set_title("Plan from Hanging (decoded)")
@@ -522,7 +567,7 @@ def plot_final_summary(agent, episode_returns, buf):
             ns_t = torch.tensor(ns_np, device=device)
             a_t  = torch.tensor(a_np,  device=device)
             z    = agent.encode(s_t)
-            z_pred_lat = F.normalize(z @ agent.A.T + a_t @ agent.B.T, dim=-1)
+            z_pred_lat = agent.dyn_step(z, a_t @ agent.B.T)
             z_next_lat = agent.encode(ns_t)
             # Decode predicted and actual next states
             s_pred = agent.decoder(z_pred_lat).cpu().numpy()
@@ -544,8 +589,8 @@ def plot_final_summary(agent, episode_returns, buf):
     # ── [1,2] Planned action sequence from hanging ──────────────────────────
     ax = fig.add_subplot(gs[1, 2])
     try:
-        th_p, td_p, acts = _decode_plan_rollout(agent, hang_state,
-                                                horizon=VIZ_PLAN_HORIZON, plan_iters=VIZ_PLAN_ITERS)
+        th_p, td_p, acts = _plan_rollout(agent, hang_state,
+                                         horizon=VIZ_PLAN_HORIZON, plan_iters=VIZ_PLAN_ITERS)
         t_ax = np.arange(len(acts))
         ax.bar(t_ax, acts, color="#ff7f0e", alpha=0.8)
         ax.axhline(0, color="black", lw=0.8)
@@ -573,7 +618,7 @@ def plot_final_summary(agent, episode_returns, buf):
             z_t = z0
             u   = torch.tanh(u_logits)
             for t in range(VIZ_PLAN_HORIZON):
-                z_t = F.normalize(z_t @ agent.A.T + (agent.B @ u[t]).unsqueeze(0), dim=-1)
+                z_t = agent.dyn_step(z_t, (agent.B @ u[t]).unsqueeze(0))
             loss = -agent.v_net(z_t).mean()
             (g,) = torch.autograd.grad(loss, u_logits, only_inputs=True)
             u_logits.grad = g
@@ -583,7 +628,7 @@ def plot_final_summary(agent, episode_returns, buf):
             z_t   = z0
             v_traj = [agent.v_net(z_t).item()]
             for t in range(VIZ_PLAN_HORIZON):
-                z_t = F.normalize(z_t @ agent.A.T + (agent.B @ u_opt[t]).unsqueeze(0), dim=-1)
+                z_t = agent.dyn_step(z_t, (agent.B @ u_opt[t]).unsqueeze(0))
                 v_traj.append(agent.v_net(z_t).item())
         ax.plot(v_traj, "o-", color="#9467bd", lw=2, ms=5)
         ax.set_xlabel("Plan step")
@@ -599,10 +644,338 @@ def plot_final_summary(agent, episode_returns, buf):
 
 
 # ---------------------------------------------------------------------------
+# Discrete Toeplitz test: train with ortho_a=True, compare planners
+# ---------------------------------------------------------------------------
+
+def _save_live_plot(episode_returns, koop_log, v_log, step, ortho_err,
+                    agent=None, buf=None, path="pendulum_toeplitz_live.png"):
+    """
+    2×3 live dashboard: training metrics (top) + state-space panels (bottom).
+    Saved to a fixed path every VIZ_EVERY steps for easy monitoring.
+    """
+    fig, axes = plt.subplots(2, 3, figsize=(17, 9))
+    fig.suptitle(f"Pendulum Koopman (ortho_a=True, SVD) — step {step:,}"
+                 f"   ‖AᵀA−I‖²={ortho_err:.1e}", fontsize=12)
+
+    # ── [0,0] Episode returns ────────────────────────────────────────────────
+    ax = axes[0, 0]
+    if episode_returns:
+        ax.plot(episode_returns, alpha=0.3, color="#4c8bc9", lw=0.8)
+        w = min(30, len(episode_returns))
+        if len(episode_returns) >= w:
+            ma = np.convolve(episode_returns, np.ones(w) / w, mode="valid")
+            ax.plot(np.arange(w - 1, len(episode_returns)), ma,
+                    color="#4c8bc9", lw=2, label=f"MA-{w}")
+    ax.axhline(-300,  color="#2ca02c", ls="--", lw=1.2, label="−300 target")
+    ax.axhline(-1200, color="#d62728", ls=":",  lw=1.0, label="random")
+    ax.set_title("Episode Returns"); ax.set_xlabel("Episode")
+    ax.legend(fontsize=8); ax.grid(alpha=0.3)
+
+    # ── [0,1] Training losses ────────────────────────────────────────────────
+    ax = axes[0, 1]
+    if koop_log:
+        ax.semilogy(koop_log, color="#e377c2", lw=1.5, label="L_koop")
+    if v_log:
+        ax.semilogy(v_log,    color="#17becf", lw=1.5, label="L_v")
+    ax.set_title("Training Losses"); ax.set_xlabel("Log step (×1k)")
+    ax.legend(fontsize=8); ax.grid(alpha=0.3)
+
+    # ── [0,2] Solve rate (ret > −300, rolling) ───────────────────────────────
+    ax = axes[0, 2]
+    if len(episode_returns) >= 10:
+        succ = [1.0 if r > -300 else 0.0 for r in episode_returns]
+        w    = min(30, len(succ))
+        roll = np.convolve(succ, np.ones(w) / w, mode="valid") * 100
+        ax.plot(np.arange(w - 1, len(succ)), roll, color="#ff7f0e", lw=2)
+    ax.set_ylim(0, 105); ax.set_title("Solve Rate (ret>−300, MA-30)")
+    ax.set_xlabel("Episode"); ax.set_ylabel("%"); ax.grid(alpha=0.3)
+
+    # ── [1,0] Value heatmap V(θ, θ̇) ─────────────────────────────────────────
+    ax = axes[1, 0]
+    if agent is not None:
+        try:
+            theta_g, tdot_g, V_grid = _value_grid(agent)
+            im = ax.imshow(V_grid, extent=[-np.pi, np.pi, -8, 8],
+                           aspect="auto", origin="lower", cmap="viridis")
+            plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            ax.axvline(0, color="white", lw=0.8, alpha=0.5)
+            ax.set_xticks([-np.pi, -np.pi/2, 0, np.pi/2, np.pi])
+            ax.set_xticklabels(["-π", "-π/2", "0", "π/2", "π"])
+        except Exception as e:
+            ax.text(0.5, 0.5, str(e), ha="center", va="center",
+                    transform=ax.transAxes, fontsize=8)
+    ax.set_title("Value Function V(θ, θ̇)")
+    ax.set_xlabel("θ (rad)"); ax.set_ylabel("θ̇ (rad/s)")
+
+    # ── [1,1] State visitation on phase portrait ──────────────────────────────
+    ax = axes[1, 1]
+    if agent is not None:
+        try:
+            theta_g, tdot_g, V_grid = _value_grid(agent)
+            ax.imshow(V_grid, extent=[-np.pi, np.pi, -8, 8],
+                      aspect="auto", origin="lower", cmap="viridis", alpha=0.55)
+        except Exception:
+            pass
+    if buf is not None and buf.size > 0:
+        s_sub  = buf.states[:buf.size]
+        th, td = _to_theta_thetadot(s_sub)
+        t_col  = np.arange(buf.size) / buf.size
+        ax.scatter(th, td, c=t_col, cmap="cool", s=1.5, alpha=0.4, rasterized=True)
+    ax.set_xlim(-np.pi, np.pi); ax.set_ylim(-8, 8)
+    ax.set_xticks([-np.pi, 0, np.pi]); ax.set_xticklabels(["-π", "0", "π"])
+    ax.set_title("State Visitation (phase portrait)")
+    ax.set_xlabel("θ (rad)"); ax.set_ylabel("θ̇ (rad/s)")
+
+    # ── [1,2] Planned trajectories (Toeplitz decoded) ────────────────────────
+    ax = axes[1, 2]
+    if agent is not None:
+        try:
+            theta_g, tdot_g, V_grid = _value_grid(agent)
+            ax.imshow(V_grid, extent=[-np.pi, np.pi, -8, 8],
+                      aspect="auto", origin="lower", cmap="viridis", alpha=0.6)
+            ax.axvline(0, color="white", lw=0.8, alpha=0.4)
+        except Exception:
+            pass
+        starts = [
+            ("hang",  np.array([-1.0,  0.0,  0.0], np.float32)),
+            ("+π/2",  np.array([ 0.0,  1.0,  2.0], np.float32)),
+            ("-π/2",  np.array([ 0.0, -1.0, -2.0], np.float32)),
+        ]
+        cmaps  = ["Oranges", "Greens", "Reds"]
+        colors = ["#ff7f0e", "#2ca02c", "#d62728"]
+        for (label, s0), cmap_name, col in zip(starts, cmaps, colors):
+            try:
+                th_p, td_p, _ = _decode_plan_rollout_dyn(agent, s0)
+                _colorline(ax, th_p, td_p, cmap=cmap_name, lw=2.0)
+                ax.plot(th_p[0],  td_p[0],  "o", color=col, ms=6, zorder=4, label=label)
+                ax.plot(th_p[-1], td_p[-1], "*", color=col, ms=8, zorder=4)
+            except Exception:
+                pass
+        ax.legend(fontsize=8, loc="upper right")
+    ax.set_xlim(-np.pi, np.pi); ax.set_ylim(-8, 8)
+    ax.set_xticks([-np.pi, 0, np.pi]); ax.set_xticklabels(["-π", "0", "π"])
+    ax.set_title("Planned Trajectories (Toeplitz decoded)")
+    ax.set_xlabel("θ (rad)"); ax.set_ylabel("θ̇ (rad/s)")
+
+    plt.tight_layout()
+    plt.savefig(path, dpi=110, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  [live] {path}", flush=True)
+
+
+def run_continuous_toeplitz(device: torch.device, n_steps: int = N_STEPS,
+                            cumulative: bool = False, sequential: bool = False,
+                            frozen_b: bool = False):
+    """
+    Train KoopmanGradientPlanner on Pendulum-v1 with continuous torque actions
+    and ortho_a=True (SVD Procrustes on CUDA → exact A ∈ O(d), linear dynamics).
+
+    Training uses act_plan_continuous (tanh-squash MPC) for exploration.
+    At the end, benchmarks plan_action_continuous vs plan_action_toeplitz_continuous
+    over N_EVAL_PLAN episodes each, reporting quality (mean return) and wall time.
+    """
+    from sheaf_rl.model import KoopmanGradientPlanner, TargetNetwork
+    from sheaf_rl.planner import plan_action_continuous, plan_action_toeplitz_continuous
+
+    env    = gym.make("Pendulum-v1")
+    agent  = KoopmanGradientPlanner(state_dim=STATE_DIM, d=D,
+                                    n_actions=ACTION_DIM,
+                                    ortho_a=True, device=device)
+    agent.encoder.no_normalize = True   # linear dynamics — no L2 normalisation
+    target = TargetNetwork(agent)       # deepcopy inherits no_normalize
+    buf    = ContinuousReplayBuffer(BUFFER_SIZE, STATE_DIM, ACTION_DIM)
+
+    neural_params = (list(agent.encoder.parameters()) +
+                     list(agent.v_net.parameters()) +
+                     list(agent.decoder.parameters()))
+    koop_params   = agent.koop_parameters()   # handles SVD parametrisation on CUDA
+    opt = optim.Adam([
+        {"params": neural_params, "lr": LR},
+        {"params": koop_params,   "lr": LR * KOOP_LR_SCALE},
+    ])
+
+    agent.to(device)
+    target.encoder.to(device)
+    target.v_net.to(device)
+
+    print("=" * 64)
+    print("  Pendulum-v1 — Continuous Koopman + Toeplitz planner test")
+    print(f"  device={device}  hard_ortho={agent._use_hard_ortho}")
+    print(f"  action_dim={ACTION_DIM}  d={D}  steps={n_steps:,}")
+    print(f"  ortho_a=True → linear dynamics (no L2 normalisation)")
+    print("=" * 64)
+    print(f"\n[Warmup: {WARMUP} random steps...]\n")
+
+    state, _ = env.reset()
+    ep_return = 0.0
+    episode_returns = []
+    koop_log, v_log = [], []
+    recent_koop, recent_v = [], []
+    t0 = time.time()
+
+    for step in range(1, n_steps + 1):
+        noise = max(NOISE_END,
+                    NOISE_START - (NOISE_START - NOISE_END) * step / NOISE_DECAY)
+
+        if step < WARMUP:
+            action = np.random.uniform(-ACTION_SCALE, ACTION_SCALE, (ACTION_DIM,))
+        else:
+            if sequential:
+                action = agent.act_plan_continuous(
+                    state, horizon=PLAN_HORIZON, plan_iters=PLAN_ITERS,
+                    action_scale=ACTION_SCALE, frozen_b=frozen_b,
+                )
+            else:
+                action = agent.act_plan_toeplitz_continuous(
+                    state, horizon=PLAN_HORIZON, plan_iters=PLAN_ITERS,
+                    gamma=GAMMA, action_scale=ACTION_SCALE,
+                    cumulative=cumulative,
+                )
+            action = np.clip(action + np.random.normal(0, noise * ACTION_SCALE,
+                                                       size=action.shape),
+                             -ACTION_SCALE, ACTION_SCALE)
+
+        next_state, reward, terminated, truncated, _ = env.step(action)
+        done = terminated or truncated
+        buf.push(state, action, reward, next_state, done)
+        ep_return += reward
+
+        if done:
+            episode_returns.append(ep_return)
+            ep_return = 0.0
+            state, _ = env.reset()
+        else:
+            state = next_state
+
+        if buf.size < BATCH_SIZE:
+            continue
+
+        batch = buf.sample(BATCH_SIZE)
+        s_b   = torch.from_numpy(batch["states"]).to(device)
+        ns_b  = torch.from_numpy(batch["next_s"]).to(device)
+        a_b   = torch.from_numpy(batch["actions"]).to(device)   # [Bs, ACTION_DIM]
+        r_b   = torch.from_numpy(batch["rewards"]).to(device)
+        d_b   = torch.from_numpy(batch["dones"]).to(device)
+
+        z_src = agent.encode(s_b)
+        with torch.no_grad():
+            z_dst_tgt = target.encoder(ns_b)
+
+        # Koopman loss — linear dynamics (dyn_step skips normalisation when ortho_a=True)
+        z_pred = agent.dyn_step(z_src, a_b @ agent.B.T)
+        L_koop = ((z_pred - z_dst_tgt.detach()).pow(2)
+                  .sum(dim=-1) * (1.0 - d_b)).mean()
+
+        # Reconstruction anchor
+        L_recon = (agent.decoder(z_src) - s_b).pow(2).mean()
+
+        # 1-step TD value loss
+        with torch.no_grad():
+            V_next = target.v_net(z_dst_tgt)
+            y_td   = r_b / REWARD_SCALE + GAMMA * V_next * (1.0 - d_b)
+        L_v = (agent.v_net(z_src) - y_td).pow(2).mean()
+
+        # Soft ortho penalty (MPS/CPU fallback; never applied on CUDA)
+        L_ortho = (agent.ortho_penalty()
+                   if (agent._ortho_a and not agent._use_hard_ortho)
+                   else torch.tensor(0.0, device=device))
+
+        loss = LAMBDA_KOOP * L_koop + LAMBDA_RECON * L_recon + LAMBDA_V * L_v + L_ortho
+        opt.zero_grad()
+        loss.backward()
+        nn.utils.clip_grad_norm_(agent.parameters(), max_norm=10.0)
+        opt.step()
+        target.update(agent, tau=EMA_TAU)
+
+        recent_koop.append(L_koop.item())
+        recent_v.append(L_v.item())
+
+        if step % 1_000 == 0:
+            elapsed = time.time() - t0; t0 = time.time()
+            mk = np.mean(recent_koop); mv = np.mean(recent_v)
+            koop_log.append(mk); v_log.append(mv)
+            recent20 = episode_returns[-20:] if episode_returns else []
+            ortho_err = agent.ortho_error()
+            print(f"  step {step:5d}  noise={noise:.3f}  L_koop={mk:.4f}  L_v={mv:.4f}"
+                  f"  ret/20={np.mean(recent20) if recent20 else float('nan'):7.1f}"
+                  f"  ‖AᵀA-I‖²={ortho_err:.1e}  sps={1000/elapsed:.0f}", flush=True)
+            recent_koop.clear(); recent_v.clear()
+
+        if step % VIZ_EVERY == 0:
+            _save_live_plot(episode_returns, koop_log, v_log, step,
+                            agent.ortho_error(), agent=agent, buf=buf)
+
+    env.close()
+
+    # ── Planner speed / quality benchmark ────────────────────────────────────
+    print("\n" + "=" * 64)
+    print(f"  Planner benchmark — {N_EVAL_PLAN} episodes each")
+    print(f"  H={PLAN_HORIZON}  iters={PLAN_ITERS}  γ={GAMMA}")
+    print("=" * 64)
+
+    eval_env = gym.make("Pendulum-v1")
+    planners = [
+        ("sequential (baseline)",
+         lambda s: plan_action_continuous(agent, s, PLAN_HORIZON, PLAN_ITERS)),
+        ("toeplitz  (GEMM)",
+         lambda s: plan_action_toeplitz_continuous(agent, s, PLAN_HORIZON, PLAN_ITERS,
+                                                   gamma=GAMMA, action_scale=ACTION_SCALE)),
+    ]
+
+    for name, fn in planners:
+        t_plan = time.time()
+        rets = []
+        for _ in range(N_EVAL_PLAN):
+            s, _ = eval_env.reset()
+            ret = 0.0
+            for _ in range(200):
+                a = fn(s)
+                s, r, term, trunc, _ = eval_env.step(a)
+                ret += r
+                if term or trunc:
+                    break
+            rets.append(ret)
+        elapsed = time.time() - t_plan
+        print(f"  {name:30s}  mean={np.mean(rets):8.1f}  std={np.std(rets):6.1f}"
+              f"  wall={elapsed:.1f}s  ({elapsed/N_EVAL_PLAN:.2f}s/ep)")
+
+    eval_env.close()
+    save_checkpoint(agent, target, episode_returns, koop_log, v_log,
+                    np.mean(episode_returns[-20:]) if episode_returns else float("nan"),
+                    path=os.path.join(VIZ_DIR, "kgp_pendulum_toeplitz.pt"))
+    _save_live_plot(episode_returns, koop_log, v_log, n_steps,
+                    agent.ortho_error(), agent=agent, buf=buf)
+    plot_final_summary(agent, episode_returns, buf)
+
+
+# ---------------------------------------------------------------------------
 # Main: setup + training + evaluation + final viz
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--toeplitz", action="store_true",
+                        help="Continuous Toeplitz GEMM planner test (ortho_a=True)")
+    parser.add_argument("--cumulative", action="store_true",
+                        help="Use cumulative value objective during training (default: terminal-only)")
+    parser.add_argument("--sequential", action="store_true",
+                        help="Use sequential planner for data collection (default: Toeplitz)")
+    parser.add_argument("--frozen_b", action="store_true",
+                        help="Detach B in sequential planner (isolates live-vs-frozen-B hypothesis)")
+    parser.add_argument("--steps", type=int, default=N_STEPS)
+    parser.add_argument("--device", default="auto")
+    args = parser.parse_args()
+
+    if args.device == "auto":
+        _dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        _dev = torch.device(args.device)
+
+    if args.toeplitz:
+        run_continuous_toeplitz(_dev, n_steps=args.steps, cumulative=args.cumulative,
+                                sequential=args.sequential, frozen_b=args.frozen_b)
+        sys.exit(0)
+
     device = torch.device("cpu")
 
     env    = gym.make("Pendulum-v1")

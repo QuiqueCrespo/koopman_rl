@@ -32,6 +32,8 @@ from train import WARMUP, N_STEPS, EPS_START, EPS_END, EPS_DECAY, LOG_EVERY
 from plot import _value_grid, _policy_grid
 
 import numpy as np
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import torch
 

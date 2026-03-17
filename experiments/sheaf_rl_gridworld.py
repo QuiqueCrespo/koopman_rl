@@ -17,6 +17,8 @@ Global state X: 90-dimensional (9 states x 10)
 import numpy as np
 from scipy.sparse import lil_matrix, csr_matrix
 from scipy.sparse.linalg import eigsh
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 
@@ -289,7 +291,7 @@ def visualize(V: np.ndarray, policy: list[int], save_path: str = "sheaf_rl_value
     plt.tight_layout()
     plt.savefig(save_path, dpi=150)
     print(f"\n  Heatmap saved → {save_path}")
-    plt.show()
+    plt.close()
 
 # ---------------------------------------------------------------------------
 # Main

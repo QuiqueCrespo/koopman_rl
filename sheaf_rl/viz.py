@@ -13,6 +13,8 @@ Public API:
 import numpy as np
 import torch
 import torch.nn.functional as F
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 
@@ -222,13 +224,37 @@ def plot_live(
         ax.set_title("Directed Value Distribution"); ax.legend(fontsize=9)
     else:
         if episode_returns:
-            w = min(50, len(episode_returns))
-            ax.plot(episode_returns, alpha=0.25, color="gray", linewidth=0.6)
+            succ = [1.0 if r > 0 else 0.0 for r in episode_returns]
+            w = min(50, len(succ))
+            ep_x = np.arange(len(succ))
+            # Raw returns as faint scatter
+            ax.scatter(ep_x, episode_returns, s=2, color="gray", alpha=0.3, zorder=1)
+            # Rolling return
             if len(episode_returns) >= w:
-                roll = np.convolve(episode_returns, np.ones(w) / w, mode="valid")
-                ax.plot(np.arange(w - 1, len(episode_returns)), roll,
-                        color="royalblue", linewidth=1.5)
-        ax.set_title("Episode Returns"); ax.set_xlabel("Episode"); ax.set_ylabel("Return")
+                roll_ret = np.convolve(episode_returns, np.ones(w) / w, mode="valid")
+                ax.plot(np.arange(w - 1, len(succ)), roll_ret,
+                        color="tomato", linewidth=1.2, label=f"Return (rolling {w})", zorder=2)
+            ax.set_ylabel("Return", color="tomato")
+            ax.tick_params(axis="y", labelcolor="tomato")
+            # Success rate on twin axis
+            ax2 = ax.twinx()
+            if len(succ) >= w:
+                roll_sr = np.convolve(succ, np.ones(w) / w, mode="valid") * 100
+                ax2.plot(np.arange(w - 1, len(succ)), roll_sr,
+                         color="royalblue", linewidth=1.5, label=f"Success % (rolling {w})", zorder=3)
+            ax2.axhline(100, color="green", linestyle="--", linewidth=0.8, alpha=0.6)
+            ax2.set_ylabel("Success rate (%)", color="royalblue")
+            ax2.tick_params(axis="y", labelcolor="royalblue")
+            ax2.set_ylim(0, 108)
+            n_succ = int(sum(succ))
+            # Combined legend
+            lines1, labs1 = ax.get_legend_handles_labels()
+            lines2, labs2 = ax2.get_legend_handles_labels()
+            ax.legend(lines1 + lines2, labs1 + labs2, fontsize=8, loc="upper left")
+            ax.set_title(f"Returns & Success Rate  ({n_succ}/{len(succ)} ep)")
+            ax.set_xlabel("Episode")
+        else:
+            ax.set_title("Returns & Success Rate")
     ax.grid(True, alpha=0.3)
 
     ax = axes[1, 0]
@@ -255,7 +281,8 @@ def plot_live(
             Z = agent.encode(test_pts)
         Z_np = Z.numpy()
         Z_c  = Z_np - Z_np.mean(axis=0, keepdims=True)
-        _, _, Vt = np.linalg.svd(Z_c, full_matrices=False)
+        _, s_vals, Vt = np.linalg.svd(Z_c, full_matrices=False)
+        var_exp = (s_vals[:2] ** 2).sum() / (s_vals ** 2).sum() * 100
         proj = Z_c @ Vt[:2].T
         ax.scatter(proj[:, 0], proj[:, 1], c="lightgray", s=10, zorder=2)
         for a in range(n_a):
@@ -271,7 +298,8 @@ def plot_live(
     except Exception:
         ax.text(0.5, 0.5, "Dynamics plot unavailable", ha="center", va="center",
                 transform=ax.transAxes)
-    ax.set_title("Linear Dynamics (PCA-2D)")
+        var_exp = 0.0
+    ax.set_title(f"Linear Dynamics (PCA-2D, {var_exp:.0f}% var)")
     ax.set_xlabel("PC$_1$"); ax.set_ylabel("PC$_2$")
 
     run = cfg.run_name if cfg else "run"
@@ -305,22 +333,39 @@ def plot_results(history: dict, cfg=None) -> None:
     ax.set_title("Training Losses"); ax.legend(); ax.grid(True, alpha=0.3)
 
     ax = axes[0, 1]
-    ax.plot(ep_returns, alpha=0.25, color="gray", linewidth=0.6, label="Raw return")
-    w2 = min(50, len(ep_returns))
+    succ = [1.0 if r > 0 else 0.0 for r in ep_returns]
+    w2 = min(50, len(succ))
+    ep_x = np.arange(len(succ))
+    ax.scatter(ep_x, ep_returns, s=2, color="gray", alpha=0.3, zorder=1)
     if len(ep_returns) >= w2:
-        roll = np.convolve(ep_returns, np.ones(w2) / w2, mode="valid")
-        ax.plot(np.arange(w2 - 1, len(ep_returns)), roll,
-                color="royalblue", linewidth=1.5, label=f"Rolling mean ({w2} ep)")
-    ax.axhline(1.0, color="green", linestyle="--", linewidth=0.8)
-    ax.set_xlabel("Episode"); ax.set_ylabel("Return")
-    ax.set_title("Episode Returns"); ax.legend(); ax.grid(True, alpha=0.3)
+        roll_ret = np.convolve(ep_returns, np.ones(w2) / w2, mode="valid")
+        ax.plot(np.arange(w2 - 1, len(succ)), roll_ret,
+                color="tomato", linewidth=1.2, label=f"Return (rolling {w2})", zorder=2)
+    ax.set_ylabel("Return", color="tomato")
+    ax.tick_params(axis="y", labelcolor="tomato")
+    ax2 = axes[0, 1].twinx()
+    if len(succ) >= w2:
+        roll_sr = np.convolve(succ, np.ones(w2) / w2, mode="valid") * 100
+        ax2.plot(np.arange(w2 - 1, len(succ)), roll_sr,
+                 color="royalblue", linewidth=1.5, label=f"Success % (rolling {w2})", zorder=3)
+    ax2.axhline(100, color="green", linestyle="--", linewidth=0.8, alpha=0.6)
+    ax2.set_ylabel("Success rate (%)", color="royalblue")
+    ax2.tick_params(axis="y", labelcolor="royalblue")
+    ax2.set_ylim(0, 108)
+    n_succ = int(sum(succ))
+    lines1, labs1 = ax.get_legend_handles_labels()
+    lines2, labs2 = ax2.get_legend_handles_labels()
+    ax.legend(lines1 + lines2, labs1 + labs2, fontsize=8, loc="upper left")
+    ax.set_xlabel("Episode")
+    ax.set_title(f"Returns & Success Rate  ({n_succ}/{len(succ)} ep)")
+    ax.grid(True, alpha=0.3)
 
     ax = axes[1, 0]
     XX, YY, V = value_grid(agent, cfg, res=100)
     im = ax.pcolormesh(XX, YY, V, cmap="plasma", shading="auto")
     plt.colorbar(im, ax=ax, label=r"$V_\psi(f_\theta(s))$")
     ax.add_patch(goal_patch(cfg, label="Goal zone"))
-    ax.set_title(r"Learned Value Map $V(x,y)$  [directed VI targets]")
+    ax.set_title(r"Learned Value Map $V(x,y)$")
     ax.set_xlabel("x"); ax.set_ylabel("y")
     ax.legend(loc="lower left", fontsize=8); ax.set_aspect("equal")
 
@@ -333,7 +378,8 @@ def plot_results(history: dict, cfg=None) -> None:
         Z = agent.encode(test_pts)
     Z_np = Z.numpy()
     Z_c  = Z_np - Z_np.mean(axis=0, keepdims=True)
-    _, _, Vt = np.linalg.svd(Z_c, full_matrices=False)
+    _, s_vals, Vt = np.linalg.svd(Z_c, full_matrices=False)
+    var_exp = (s_vals[:2] ** 2).sum() / (s_vals ** 2).sum() * 100
     proj = Z_c @ Vt[:2].T
     ax.scatter(proj[:, 0], proj[:, 1], c="lightgray", s=12, zorder=2, label=r"$z_s$")
     for a in range(n_a):
@@ -346,15 +392,15 @@ def plot_results(history: dict, cfg=None) -> None:
                   scale=1, scale_units="xy", width=0.003, headwidth=5,
                   label=ACTION_NAMES[a])
     ax.legend(fontsize=8, loc="best")
-    ax.set_title("Linear Dynamics in Latent Space (PCA-2D)\n"
-                 r"Arrows: $\mathrm{normalize}(Az + Be_a) \to$ predicted $z_{t+1}$")
+    ax.set_title(f"Linear Dynamics (PCA-2D, {var_exp:.0f}% var)\n"
+                 r"Arrows: $Az + Be_a \to$ predicted $z_{t+1}$")
     ax.set_xlabel("PC$_1$"); ax.set_ylabel("PC$_2$")
 
     run = cfg.run_name if cfg else "run"
     plt.tight_layout()
     plt.savefig(f"{run}_results.png", dpi=150)
     print(f"\nSaved -> {run}_results.png")
-    plt.show()
+    plt.close()
 
 
 # ---------------------------------------------------------------------------
@@ -384,7 +430,7 @@ def plot_planner_comparison(results: dict) -> None:
     plt.tight_layout()
     plt.savefig("planner_comparison.png", dpi=130)
     print("\nSaved → planner_comparison.png")
-    plt.show()
+    plt.close()
 
 
 # ---------------------------------------------------------------------------
@@ -465,4 +511,4 @@ def plot_ablation_comparison(results: list, out: str = "ablation_comparison.png"
     plt.tight_layout()
     plt.savefig(out, dpi=130, bbox_inches="tight")
     print(f"\nSaved → {out}")
-    plt.show()
+    plt.close()

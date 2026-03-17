@@ -4,6 +4,8 @@ Visualisation utilities for the gravity basin Sheaf-RL agent.
 
 import numpy as np
 import torch
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 
@@ -182,4 +184,4 @@ def plot_results(history: dict) -> None:
     plt.tight_layout()
     plt.savefig("gravity_basin_results.png", dpi=150)
     print("\nSaved → gravity_basin_results.png")
-    plt.show()
+    plt.close()

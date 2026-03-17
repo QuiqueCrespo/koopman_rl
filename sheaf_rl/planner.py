@@ -287,17 +287,204 @@ def plan_action_softmax_cumulative(
         return logits[0].argmax().item()
 
 
+def plan_action_toeplitz(
+    agent,
+    state:      np.ndarray,
+    horizon:    int   = 10,
+    plan_iters: int   = 20,
+    lr:         float = 0.1,
+    tau:        float = 1.0,
+    gamma:      float = 0.95,
+    cfg: Config = None,
+) -> int:
+    """
+    Block-Toeplitz GEMM planner — O(H²d²) precompute, single GEMM per grad step.
+
+    Exploits exact orthogonality (ortho_a=True) to unroll the entire H-step
+    latent trajectory as a closed-form linear system:
+
+        Z = ZIR + W_toeplitz X
+
+    where:
+      ZIR[k]           = A^{k+1} z₀        (free / zero-input response)
+      W_toeplitz[i,j]  = A^{i-j}  (i≥j)   (lower-triangular Block-Toeplitz)
+      X[t]             = B aₜ               (latent action vectors, [H, d])
+
+    Both ZIR and W_toeplitz are pre-computed once outside the Adam loop with
+    torch.no_grad(). Each plan_iter reduces to a single dense GEMM
+    (W_toeplitz @ X_flat) plus one V-net forward pass — no sequential rollout.
+
+    The backward pass tracks gradient only through the GEMM input X (which
+    depends on logits via Gumbel-Softmax), not through H chained dyn_step calls.
+    Memory footprint of the autograd graph is O(H d) instead of O(H² d).
+
+    Requires ortho_a=True; for normalised (spherical) dynamics the linear
+    superposition principle does not hold.
+    """
+    if cfg:
+        gamma = cfg.algo.gamma
+    n_acts = cfg.env.n_actions if cfg else agent.n_actions
+    device = next(agent.parameters()).device
+    d      = agent.d
+
+    with torch.no_grad():
+        z0 = agent.encoder(
+            torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(device)
+        ).squeeze(0)  # [d]
+
+        A = agent.A.detach()  # [d, d], exact O(d) matrix via SVD parametrisation
+
+        # Build A^0 … A^H iteratively — O(H) matmuls of size d×d
+        A_pows = [torch.eye(d, device=device)]
+        for _ in range(horizon):
+            A_pows.append(A_pows[-1] @ A)
+        A_stack = torch.stack(A_pows)  # [H+1, d, d]
+
+        # Zero-Input Response: ZIR[k] = A^{k+1} z₀  (≡ z₀ @ (Aᵀ)^{k+1} for 1-D)
+        ZIR = torch.einsum('kij,j->ki', A_stack[1:], z0)  # [H, d]
+
+        # Causal indices for Block-Toeplitz
+        row_idx   = torch.arange(horizon, device=device).unsqueeze(1)   # [H, 1]
+        col_idx   = torch.arange(horizon, device=device).unsqueeze(0)   # [1, H]
+        power_idx = (row_idx - col_idx).clamp(min=0)                    # [H, H]
+        causal    = (row_idx >= col_idx).float()                         # lower-tri mask
+
+        # Gather blocks → [H, H, d, d], zero upper triangle
+        W_blocks = A_stack[power_idx] * causal.unsqueeze(-1).unsqueeze(-1)
+
+        # Reshape to [H·d, H·d]: one dense GEMM replaces H sequential matmuls
+        W_toeplitz = W_blocks.permute(0, 2, 1, 3).reshape(horizon * d, horizon * d)
+
+        # Discount weights γ¹ … γᴴ
+        gammas = (gamma ** torch.arange(1, horizon + 1, device=device)).unsqueeze(1)
+
+    B = agent.B.detach()  # [d, n_acts]
+
+    logits = torch.zeros(horizon, n_acts, device=device, requires_grad=True)
+    opt    = optim.Adam([logits], lr=lr)
+
+    for _ in range(plan_iters):
+        opt.zero_grad()
+
+        probs  = F.gumbel_softmax(logits, tau=tau, hard=True, dim=-1)   # [H, n_acts]
+        X      = probs @ B.T                                             # [H, d]
+        X_flat = X.reshape(horizon * d, 1)
+
+        # Single cuBLAS GEMM — entire horizon parallelised on GPU
+        ZSR  = (W_toeplitz @ X_flat).reshape(horizon, d)
+        Z    = ZIR + ZSR                                                 # [H, d]
+        loss = -(gammas * agent.v_net(Z)).sum()
+
+        (grad_l,) = torch.autograd.grad(loss, logits, only_inputs=True)
+        logits.grad = grad_l
+        opt.step()
+
+    with torch.no_grad():
+        return logits[0].argmax().item()
+
+
+def plan_action_toeplitz_continuous(
+    agent,
+    state:        np.ndarray,
+    horizon:      int   = 10,
+    plan_iters:   int   = 20,
+    lr:           float = 0.1,
+    gamma:        float = 0.95,
+    action_scale: float = 1.0,
+    cumulative:   bool  = True,
+    cfg: Config = None,
+) -> np.ndarray:
+    """
+    Block-Toeplitz GEMM planner for continuous action spaces.
+
+    Identical structure to plan_action_toeplitz (discrete) but parameterises
+    actions as tanh-squashed logits instead of Gumbel-Softmax one-hots.
+
+        X[t] = B tanh(u_logits[t]) ∈ R^d
+
+    ZIR and W_toeplitz are pre-computed once; each plan_iter is a single
+    dense GEMM (W_toeplitz @ X_flat) instead of H sequential dyn_step calls.
+
+    Requires ortho_a=True for the linear superposition Z = ZIR + W X to hold.
+    Returns action ∈ [-action_scale, action_scale]^action_dim.
+    """
+    if cfg:
+        gamma = cfg.algo.gamma
+    device     = next(agent.parameters()).device
+    d          = agent.d
+    action_dim = agent.B.shape[1]
+
+    with torch.no_grad():
+        z0 = agent.encoder(
+            torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(device)
+        ).squeeze(0)  # [d]
+
+        A = agent.A.detach()
+
+        A_pows = [torch.eye(d, device=device)]
+        for _ in range(horizon):
+            A_pows.append(A_pows[-1] @ A)
+        A_stack = torch.stack(A_pows)  # [H+1, d, d]
+
+        ZIR = torch.einsum('kij,j->ki', A_stack[1:], z0)  # [H, d]
+
+        row_idx   = torch.arange(horizon, device=device).unsqueeze(1)
+        col_idx   = torch.arange(horizon, device=device).unsqueeze(0)
+        power_idx = (row_idx - col_idx).clamp(min=0)
+        causal    = (row_idx >= col_idx).float()
+        W_blocks  = A_stack[power_idx] * causal.unsqueeze(-1).unsqueeze(-1)
+        W_toeplitz = W_blocks.permute(0, 2, 1, 3).reshape(horizon * d, horizon * d)
+
+        gammas = (gamma ** torch.arange(1, horizon + 1, device=device)).unsqueeze(1)
+
+    B = agent.B.detach()  # [d, action_dim]
+
+    u_logits = torch.randn(horizon, action_dim, device=device) * 1e-4
+    u_logits.requires_grad_(True)
+    opt = optim.Adam([u_logits], lr=lr)
+
+    for _ in range(plan_iters):
+        opt.zero_grad()
+
+        u      = torch.tanh(u_logits)           # [H, action_dim]
+        X      = u @ B.T                         # [H, d]
+        X_flat = X.reshape(horizon * d, 1)
+
+        ZSR  = (W_toeplitz @ X_flat).reshape(horizon, d)
+        Z    = ZIR + ZSR                         # [H, d]
+
+        # Terminal-only: less prone to value overestimation during data collection.
+        # Cumulative: richer signal, better at eval once V is well-calibrated.
+        if cumulative:
+            loss = -(gammas * agent.v_net(Z)).sum()
+        else:
+            loss = -agent.v_net(Z[-1]).unsqueeze(0).mean()
+
+        (grad_u,) = torch.autograd.grad(loss, u_logits, only_inputs=True)
+        u_logits.grad = grad_u
+        opt.step()
+
+    with torch.no_grad():
+        return (torch.tanh(u_logits[0]) * action_scale).cpu().numpy()
+
+
 def plan_action_continuous(
     agent,
     state:      np.ndarray,
     horizon:    int   = 10,
     plan_iters: int   = 20,
     lr:         float = 0.1,
+    frozen_b:   bool  = False,
     cfg: Config = None,
 ) -> np.ndarray:
-    """Differentiable MPC for continuous action spaces. Returns action vector."""
+    """Differentiable MPC for continuous action spaces. Returns action vector.
+
+    frozen_b=True detaches B before the planning loop (matches Toeplitz behaviour)
+    to isolate whether live vs detached B explains the training performance gap.
+    """
     device     = next(agent.parameters()).device
     action_dim = agent.B.shape[1]
+    B          = agent.B.detach() if frozen_b else agent.B
 
     with torch.no_grad():
         z_start = agent.encoder(
@@ -313,7 +500,7 @@ def plan_action_continuous(
         z_t = z_start
         u   = torch.tanh(u_logits)
         for t in range(horizon):
-            latent_step = (agent.B @ u[t]).unsqueeze(0)
+            latent_step = (B @ u[t]).unsqueeze(0)
             z_t         = agent.dyn_step(z_t, latent_step)
         loss = -agent.v_net(z_t).mean()
 

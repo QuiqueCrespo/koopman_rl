@@ -17,6 +17,8 @@ import torch.nn as nn
 import torch.optim as optim
 from scipy.sparse import lil_matrix, csr_matrix
 from scipy.sparse.linalg import eigsh
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 # ---------------------------------------------------------------------------
@@ -354,7 +356,7 @@ def main():
     plt.tight_layout()
     plt.savefig("sheaf_rl_neural_values.png", dpi=150)
     print("\nSaved → sheaf_rl_neural_values.png")
-    plt.show()
+    plt.close()
 
 
 if __name__ == "__main__":

@@ -1,38 +1,19 @@
 """
 Neural components: Encoder, ValueNetwork, QNetwork, KoopmanGradientPlanner, TargetNetwork.
 
-NOTE — ortho_a on GPU vs MPS:
-  Currently ortho_a=True uses a soft penalty ||AᵀA − I||²_F added to the loss
-  (see ortho_penalty() and LAMBDA_ORTHO in algorithms.py).  This is a workaround
-  for MPS: torch.linalg.svd and torch.linalg.qr both fall back to CPU on MPS,
-  causing a device round-trip on every forward+backward pass.
+NOTE — ortho_a device dispatch:
+  ortho_a=True uses differentiable SVD Procrustes on CUDA and a soft penalty on MPS/CPU.
 
-  On a CUDA GPU, use PyTorch's native orthogonal parametrization instead.
-  DO NOT use SVD on the forward pass — even on CUDA, svd is a sequential iterative
-  algorithm that does not parallelise well across CUDA cores and will silently
-  bottleneck throughput for any d ≥ 64.
+  CUDA → _SVDOrthogonal parametrization: A = U Vᵀ  from  W = U Σ Vᵀ.
+    Covers all of O(d) (det=±1).  W initialised ~ N(0,1/d) so singular
+    values are generically distinct → stable backward pass.
+    _use_hard_ortho=True; soft penalty never applied.
 
-  The correct CUDA approach uses the Cayley map  A = (I − S)(I + S)⁻¹  where S is
-  skew-symmetric, or the matrix exponential.  Both are parallelisable matmuls and
-  PyTorch exposes them via the native orthogonal parametrization:
+  MPS / CPU → soft penalty  λ · ||AᵀA − I||²_F  added to the loss.
+    torch.linalg.svd falls back to CPU on MPS; the penalty avoids the
+    device round-trip.  _use_hard_ortho=False.
 
-    import torch.nn.utils.parametrizations as parametrizations  # note: not parametrize
-
-    # in KoopmanGradientPlanner.__init__, replace self.A = nn.Parameter(torch.eye(d)) with:
-    self.A_layer = nn.Linear(d, d, bias=False)
-    parametrizations.orthogonal(self.A_layer, 'weight')   # Cayley/matrix-exp, NOT SVD
-    # access as self.A_layer.weight; add a property 'A' for drop-in compatibility.
-
-  This guarantees ||A z|| = ||z|| exactly at every step with near-zero forward-pass
-  overhead.  The soft penalty (current default) only approximately enforces this and
-  can drift under large learning rates.
-
-  BONUS — parallel horizon unroll (CUDA only):
-  With A strictly orthonormal you can pre-compute the matrix powers A¹…Aᴴ and
-  evaluate the entire H-step lookahead as a single batched matmul (equivalent to a
-  1-D causal convolution in latent space) rather than a Python for-loop.  This makes
-  plan_action_* O(1) wall-clock in H instead of O(H) and is the right path for
-  longer horizons / real-time inference.
+  Device is passed at construction via from_cfg(cfg, device=device).
 """
 
 import copy
@@ -41,7 +22,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.nn.utils.parametrizations as parametrizations
+import torch.nn.utils.parametrize as parametrize
 
 from sheaf_rl.config import Config, ModelConfig, EnvConfig
 
@@ -127,6 +108,27 @@ class ValueNetwork(nn.Module):
         return self.net(z).squeeze(-1)
 
 
+class _SVDOrthogonal(nn.Module):
+    """
+    Differentiable Procrustes SVD parametrization:  W → U Vᵀ
+    where  W = U Σ Vᵀ  (thin SVD via torch.linalg.svd).
+
+    The result A = U Vᵀ is exactly in O(d).  Gradient flows through the SVD
+    via PyTorch autograd.
+
+    Gradient stability note:
+      The SVD backward contains 1/(σᵢ²−σⱼ²) terms.  These blow up when any
+      two singular values of W are equal.  We therefore require W to be
+      initialised as a random Gaussian matrix (see KoopmanGradientPlanner),
+      NOT as identity or an orthogonal matrix (all σ=1 → immediately NaN).
+      After the first optimiser step, W leaves the degenerate manifold and
+      singular values are generically distinct for all subsequent steps.
+    """
+    def forward(self, W: torch.Tensor) -> torch.Tensor:
+        U, _, Vh = torch.linalg.svd(W, full_matrices=False)
+        return U @ Vh
+
+
 class KoopmanGradientPlanner(nn.Module):
     """
     Formerly SheafAgent. Renamed to reflect primary usage: MPC via learned
@@ -134,11 +136,12 @@ class KoopmanGradientPlanner(nn.Module):
 
     Latent transition model:
         ortho_a=False (default): z_{t+1} = normalize(A z_t + B a_t)
-        ortho_a=True  (linear):  z_{t+1} = A z_t + B a_t   (A ≈ orthonormal via
-                                            soft penalty ||AᵀA − I||²_F in loss)
+        ortho_a=True  (linear):  z_{t+1} = A z_t + B a_t,  A ∈ O(d)
+            CUDA  → hard constraint via Cayley parametrization (exact, no penalty)
+            MPS/CPU → soft penalty ||AᵀA − I||²_F in the loss (see ortho_penalty())
 
-    A ∈ R^{d×d}   — shared state dynamics (free parameter, penalised toward O(d))
-    B ∈ R^{d×|A|} — action input matrix (free, cols orthonormal at init)
+    A ∈ R^{d×d}   — shared state dynamics
+    B ∈ R^{d×|A|} — action input matrix (cols orthonormal at init)
     a_t           — one-hot for discrete actions, or continuous vector for cont. envs
 
     Use dyn_step(z, b_vec) for all transition computations — it dispatches the
@@ -146,38 +149,50 @@ class KoopmanGradientPlanner(nn.Module):
     """
     def __init__(self, state_dim: int = STATE_DIM, d: int = D,
                  n_actions: int = N_ACTIONS, ortho_a: bool = False,
-                 tanh_out: bool = False):
+                 tanh_out: bool = False, device=None):
         super().__init__()
         self.d         = d
         self.n_actions = n_actions
         self._ortho_a  = ortho_a
         self.encoder   = Encoder(state_dim, d, tanh_out=tanh_out)
         self.v_net     = ValueNetwork(d)
-        self.decoder   = nn.Linear(d, state_dim)     # reconstruction anchor (anti-collapse)
+        self.decoder   = nn.Linear(d, state_dim)
 
-        if ortho_a:
-            # Hard orthogonal constraint via Cayley map / matrix exponential.
-            # parametrizations.orthogonal keeps A ∈ O(d) exactly after every step.
-            # Uses matrix_exp (Taylor-series matmuls) — MPS/CUDA-native, no SVD.
-            # Optimizer sees the unconstrained pre-image; .weight gives the O(d) matrix.
+        # CUDA: SVD Procrustes hard constraint (covers full O(d), det=±1).
+        # MPS/CPU: unconstrained A + soft penalty in loss (no linalg.svd round-trip).
+        dev_type = torch.device(device).type if device is not None else "cpu"
+        self._use_hard_ortho = ortho_a and dev_type == "cuda"
+
+        if self._use_hard_ortho:
+            # W ~ N(0, 1/d): generically distinct singular values → stable SVD backward.
+            # Identity / orthogonal init gives all σ=1 → 1/(σᵢ²−σⱼ²) = NaN.
             self._A_layer = nn.Linear(d, d, bias=False)
-            nn.init.eye_(self._A_layer.weight)       # start as identity
-            parametrizations.orthogonal(self._A_layer, 'weight', orthogonal_map="matrix_exp")
+            nn.init.normal_(self._A_layer.weight, std=1.0 / (d ** 0.5))
+            parametrize.register_parametrization(self._A_layer, 'weight', _SVDOrthogonal())
         else:
-            # Default: unconstrained A; normalisation applied in dyn_step instead.
-            self.A = nn.Parameter(torch.eye(d))      # [d, d]
+            # Unconstrained; soft penalty applied in loss when ortho_a=True.
+            self.A = nn.Parameter(torch.eye(d))
 
-        # B columns orthonormal at init (both modes)
         B = torch.empty(d, n_actions)
         nn.init.orthogonal_(B)
-        self.B = nn.Parameter(B)                     # [d, n_actions]
+        self.B = nn.Parameter(B)
 
     def __getattr__(self, name: str):
-        # When ortho_a=True, 'A' is not a Parameter — intercept and return
-        # the parametrized weight (the actual O(d) matrix).
-        if name == 'A' and self.__dict__.get('_ortho_a', False):
+        # With hard constraint, 'A' is not a bare Parameter — return the O(d) weight.
+        if name == 'A' and self.__dict__.get('_use_hard_ortho', False):
             return self._modules['_A_layer'].weight
         return super().__getattr__(name)
+
+    def ortho_penalty(self) -> torch.Tensor:
+        """Soft ||AᵀA − I||²_F penalty (MPS/CPU only — never called when _use_hard_ortho)."""
+        A = self.A
+        return (A.T @ A - torch.eye(self.d, device=A.device)).pow(2).sum()
+
+    def ortho_error(self) -> float:
+        """||AᵀA − I||²_F as a plain float. Device-safe — uses A.device for the identity."""
+        with torch.no_grad():
+            A = self.A
+            return (A.T @ A - torch.eye(self.d, device=A.device)).pow(2).sum().item()
 
     def dyn_step(self, z: torch.Tensor, b_vec: torch.Tensor) -> torch.Tensor:
         """
@@ -195,19 +210,19 @@ class KoopmanGradientPlanner(nn.Module):
 
     def koop_parameters(self) -> list:
         """Parameter list for the Koopman optimizer group (A and B).
-        With ortho_a=True, returns the underlying pre-image parameters that the
-        optimizer updates — not the projected weight (which is read-only)."""
-        A_params = list(self._A_layer.parameters()) if self._ortho_a else [self.A]
+        With hard ortho, returns the Cayley pre-image parameters (not the read-only O(d) weight)."""
+        A_params = list(self._A_layer.parameters()) if self._use_hard_ortho else [self.A]
         return A_params + [self.B]
 
     @classmethod
-    def from_cfg(cls, cfg: Config) -> "KoopmanGradientPlanner":
+    def from_cfg(cls, cfg: Config, device=None) -> "KoopmanGradientPlanner":
         return cls(
             state_dim=cfg.env.state_dim,
             d=cfg.model.d,
             n_actions=cfg.env.n_actions,
             ortho_a=cfg.model.ortho_a,
             tanh_out=cfg.model.tanh_out,
+            device=device,
         )
 
     def encode(self, state: torch.Tensor) -> torch.Tensor:
@@ -249,12 +264,37 @@ class KoopmanGradientPlanner(nn.Module):
         from sheaf_rl.planner import plan_action_gumbel
         return plan_action_gumbel(self, state, horizon, plan_iters, tau=tau)
 
+    def act_plan_toeplitz(self, state: np.ndarray,
+                          horizon: int = 10, plan_iters: int = 20,
+                          lr: float = 0.1, tau: float = 1.0,
+                          gamma: float = 0.95) -> int:
+        """Block-Toeplitz GEMM planner — requires ortho_a=True.
+        Pre-computes ZIR and W_toeplitz outside the Adam loop; each iteration
+        is a single dense GEMM instead of H sequential dyn_step calls."""
+        from sheaf_rl.planner import plan_action_toeplitz
+        return plan_action_toeplitz(self, state, horizon, plan_iters,
+                                    lr=lr, tau=tau, gamma=gamma)
+
     def act_plan_continuous(self, state: np.ndarray,
                             horizon: int = 10, plan_iters: int = 20,
-                            action_scale: float = 1.0) -> np.ndarray:
+                            action_scale: float = 1.0,
+                            frozen_b: bool = False) -> np.ndarray:
         """tanh-squash MPC — continuous environments. Returns action ∈ [-scale, scale]^d."""
         from sheaf_rl.planner import plan_action_continuous
-        return plan_action_continuous(self, state, horizon, plan_iters) * action_scale
+        return plan_action_continuous(self, state, horizon, plan_iters,
+                                      frozen_b=frozen_b) * action_scale
+
+    def act_plan_toeplitz_continuous(self, state: np.ndarray,
+                                     horizon: int = 10, plan_iters: int = 20,
+                                     gamma: float = 0.95, action_scale: float = 1.0,
+                                     cumulative: bool = True) -> np.ndarray:
+        """Block-Toeplitz GEMM MPC — continuous environments, requires ortho_a=True.
+        cumulative=False uses terminal V only (stable for data collection);
+        cumulative=True uses discounted sum over horizon (better at eval)."""
+        from sheaf_rl.planner import plan_action_toeplitz_continuous
+        return plan_action_toeplitz_continuous(self, state, horizon, plan_iters,
+                                               gamma=gamma, action_scale=action_scale,
+                                               cumulative=cumulative)
 
 
 # Backward-compatibility alias for any existing saved checkpoints or notebooks
