@@ -1,0 +1,68 @@
+================================================================
+  Pendulum-v1 — Continuous Koopman + Toeplitz planner test
+  device=cuda  hard_ortho=True
+  action_dim=1  d=32  steps=40,000
+  ortho_a=True → linear dynamics (no L2 normalisation)
+  run_tag=seq_ou_s0
+================================================================
+
+[Warmup: 10000 random steps...]
+
+  step  1000  noise=0.940  L_koop=1.0967  L_v=0.0582  ret/20=-1148.3  ‖AᵀA-I‖²=5.9e-10  sps=94
+  step  2000  noise=0.880  L_koop=0.2930  L_v=0.0432  ret/20=-1167.9  ‖AᵀA-I‖²=6.8e-10  sps=74
+  step  3000  noise=0.820  L_koop=0.0855  L_v=0.1435  ret/20=-1114.7  ‖AᵀA-I‖²=7.7e-10  sps=74
+  step  4000  noise=0.760  L_koop=0.0470  L_v=0.2975  ret/20=-1152.1  ‖AᵀA-I‖²=7.6e-10  sps=74
+  step  5000  noise=0.700  L_koop=0.0573  L_v=0.5631  ret/20=-1214.8  ‖AᵀA-I‖²=6.3e-10  sps=74
+  [live] pendulum_live_seq_ou_s0.png
+  step  6000  noise=0.640  L_koop=0.0726  L_v=0.8864  ret/20=-1195.4  ‖AᵀA-I‖²=5.6e-10  sps=52
+  step  7000  noise=0.580  L_koop=0.0860  L_v=1.1049  ret/20=-1177.6  ‖AᵀA-I‖²=6.7e-10  sps=74
+  step  8000  noise=0.520  L_koop=0.0879  L_v=1.3087  ret/20=-1182.9  ‖AᵀA-I‖²=6.0e-10  sps=73
+  step  9000  noise=0.460  L_koop=0.0811  L_v=1.5975  ret/20=-1107.9  ‖AᵀA-I‖²=6.9e-10  sps=74
+  step 10000  noise=0.400  L_koop=0.0786  L_v=1.8691  ret/20=-1179.5  ‖AᵀA-I‖²=9.0e-10  sps=73
+  [live] pendulum_live_seq_ou_s0.png
+  step 11000  noise=0.340  L_koop=0.0840  L_v=2.2648  ret/20=-1030.9  ‖AᵀA-I‖²=6.2e-10  sps=7
+  step 12000  noise=0.280  L_koop=0.0910  L_v=2.3561  ret/20= -895.7  ‖AᵀA-I‖²=5.7e-10  sps=7
+  step 13000  noise=0.220  L_koop=0.0967  L_v=2.5914  ret/20= -769.2  ‖AᵀA-I‖²=6.7e-10  sps=7
+  step 14000  noise=0.160  L_koop=0.1001  L_v=2.8369  ret/20= -565.4  ‖AᵀA-I‖²=5.2e-10  sps=7
+  step 15000  noise=0.100  L_koop=0.1043  L_v=2.9507  ret/20= -659.9  ‖AᵀA-I‖²=4.5e-10  sps=7
+  [live] pendulum_live_seq_ou_s0.png
+  step 16000  noise=0.100  L_koop=0.1056  L_v=3.0365  ret/20= -511.1  ‖AᵀA-I‖²=5.6e-10  sps=7
+  step 17000  noise=0.100  L_koop=0.1052  L_v=3.2234  ret/20= -536.0  ‖AᵀA-I‖²=5.5e-10  sps=7
+  step 18000  noise=0.100  L_koop=0.1028  L_v=3.3849  ret/20= -490.9  ‖AᵀA-I‖²=5.7e-10  sps=7
+  step 19000  noise=0.100  L_koop=0.0991  L_v=3.5231  ret/20= -365.5  ‖AᵀA-I‖²=6.8e-10  sps=7
+  step 20000  noise=0.100  L_koop=0.0965  L_v=3.4276  ret/20= -370.6  ‖AᵀA-I‖²=7.6e-10  sps=7
+  [live] pendulum_live_seq_ou_s0.png
+  step 21000  noise=0.100  L_koop=0.0928  L_v=3.3472  ret/20= -223.0  ‖AᵀA-I‖²=5.6e-10  sps=6
+  step 22000  noise=0.100  L_koop=0.0867  L_v=3.4678  ret/20= -164.4  ‖AᵀA-I‖²=7.5e-10  sps=5
+  step 23000  noise=0.100  L_koop=0.0833  L_v=3.4275  ret/20= -157.2  ‖AᵀA-I‖²=7.7e-10  sps=5
+  step 24000  noise=0.100  L_koop=0.0797  L_v=3.4875  ret/20= -145.7  ‖AᵀA-I‖²=7.1e-10  sps=5
+  step 25000  noise=0.100  L_koop=0.0779  L_v=3.5385  ret/20= -168.7  ‖AᵀA-I‖²=8.0e-10  sps=6
+  [live] pendulum_live_seq_ou_s0.png
+  step 26000  noise=0.100  L_koop=0.0755  L_v=3.3004  ret/20= -312.1  ‖AᵀA-I‖²=6.2e-10  sps=9
+  step 27000  noise=0.100  L_koop=0.0727  L_v=3.6613  ret/20= -387.9  ‖AᵀA-I‖²=5.7e-10  sps=12
+  step 28000  noise=0.100  L_koop=0.0717  L_v=3.4936  ret/20= -399.6  ‖AᵀA-I‖²=7.7e-10  sps=12
+  step 29000  noise=0.100  L_koop=0.0702  L_v=3.6825  ret/20= -408.0  ‖AᵀA-I‖²=6.2e-10  sps=12
+  step 30000  noise=0.100  L_koop=0.0698  L_v=3.2586  ret/20= -378.0  ‖AᵀA-I‖²=6.1e-10  sps=12
+  [live] pendulum_live_seq_ou_s0.png
+  step 31000  noise=0.100  L_koop=0.0695  L_v=3.7702  ret/20= -328.6  ‖AᵀA-I‖²=6.4e-10  sps=12
+  step 32000  noise=0.100  L_koop=0.0693  L_v=3.5178  ret/20= -395.6  ‖AᵀA-I‖²=6.5e-10  sps=12
+  step 33000  noise=0.100  L_koop=0.0689  L_v=3.3846  ret/20= -501.7  ‖AᵀA-I‖²=7.3e-10  sps=12
+  step 34000  noise=0.100  L_koop=0.0674  L_v=3.8946  ret/20= -480.1  ‖AᵀA-I‖²=5.6e-10  sps=12
+  step 35000  noise=0.100  L_koop=0.0668  L_v=3.4328  ret/20= -467.5  ‖AᵀA-I‖²=5.2e-10  sps=12
+  [live] pendulum_live_seq_ou_s0.png
+  step 36000  noise=0.100  L_koop=0.0657  L_v=3.5531  ret/20= -503.6  ‖AᵀA-I‖²=5.8e-10  sps=12
+  step 37000  noise=0.100  L_koop=0.0654  L_v=3.6032  ret/20= -402.9  ‖AᵀA-I‖²=5.5e-10  sps=18
+  step 38000  noise=0.100  L_koop=0.0644  L_v=3.6792  ret/20= -399.7  ‖AᵀA-I‖²=5.1e-10  sps=14
+  step 39000  noise=0.100  L_koop=0.0640  L_v=3.5269  ret/20= -410.4  ‖AᵀA-I‖²=5.9e-10  sps=12
+  step 40000  noise=0.100  L_koop=0.0619  L_v=3.2214  ret/20= -368.5  ‖AᵀA-I‖²=7.2e-10  sps=12
+  [live] pendulum_live_seq_ou_s0.png
+
+================================================================
+  Planner benchmark — 20 episodes each
+  H=5  iters=10  γ=0.99
+================================================================
+  sequential (baseline)           mean= -1134.1  std= 336.4  wall=283.8s  (14.19s/ep)
+  toeplitz  (GEMM)                mean=  -363.0  std= 294.1  wall=133.4s  (6.67s/ep)
+  [ckpt] viz_pendulum/kgp_pendulum_seq_ou_s0.pt
+  [live] pendulum_live_seq_ou_s0.png
+  [viz] viz_pendulum/final_summary.png

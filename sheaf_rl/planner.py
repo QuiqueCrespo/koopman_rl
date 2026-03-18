@@ -383,6 +383,113 @@ def plan_action_toeplitz(
         return logits[0].argmax().item()
 
 
+class WarmStartToeplitzPlanner:
+    """
+    Stateful wrapper around plan_action_toeplitz_continuous that warm-starts
+    each planning call by shifting the previous solution one step forward.
+
+    On each call:
+      u_logits[0..H-2] ← previous u_logits[1..H-1]  (already-committed actions)
+      u_logits[H-1]    ← randn * 1e-4                (fresh guess for new horizon tail)
+    Adam first/second moments are shifted identically so curvature information
+    from previous steps carries over for the actions that remain in the plan.
+
+    Call reset() at episode boundaries (or after any discontinuity).
+    """
+    def __init__(self, agent, horizon: int = 10, plan_iters: int = 20,
+                 lr: float = 0.1, gamma: float = 0.95,
+                 action_scale: float = 1.0, cumulative: bool = False):
+        self.agent        = agent
+        self.horizon      = horizon
+        self.plan_iters   = plan_iters
+        self.lr           = lr
+        self.gamma        = gamma
+        self.action_scale = action_scale
+        self.cumulative   = cumulative
+        self._u_logits    = None   # [H, action_dim] float64
+        self._opt         = None
+
+    def reset(self):
+        self._u_logits = None
+        self._opt      = None
+
+    def __call__(self, state: np.ndarray) -> np.ndarray:
+        agent      = self.agent
+        device     = next(agent.parameters()).device
+        action_dim = agent.B.shape[1]
+        H          = self.horizon
+
+        # Shift previous solution or cold-start
+        if self._u_logits is not None:
+            tail = torch.randn(1, action_dim, device=device,
+                               dtype=torch.float64) * 1e-4
+            u_init = torch.cat([self._u_logits[1:].detach(), tail], dim=0)
+        else:
+            u_init = torch.randn(H, action_dim, device=device,
+                                 dtype=torch.float64) * 1e-4
+
+        u_logits = u_init.clone().requires_grad_(True)
+
+        if self._opt is not None:
+            # Rebuild Adam, transplant shifted moment estimates
+            opt = optim.Adam([u_logits], lr=self.lr)
+            prev_state = self._opt.state[self._opt.param_groups[0]['params'][0]]
+            if prev_state:
+                new_state   = opt.state[u_logits]
+                new_state['step']        = prev_state['step']
+                new_state['exp_avg']     = torch.cat(
+                    [prev_state['exp_avg'][1:], torch.zeros(1, action_dim, device=device, dtype=torch.float64)], dim=0)
+                new_state['exp_avg_sq']  = torch.cat(
+                    [prev_state['exp_avg_sq'][1:], torch.zeros(1, action_dim, device=device, dtype=torch.float64)], dim=0)
+        else:
+            opt = optim.Adam([u_logits], lr=self.lr)
+
+        # Run the optimization (same body as plan_action_toeplitz_continuous)
+        d = agent.d
+        with torch.no_grad():
+            z0 = agent.encoder(
+                torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(device)
+            ).squeeze(0).to(torch.float64)
+            A = agent.A.detach().to(torch.float64)
+            B = agent.B.detach().to(torch.float64)
+
+            A_pows = [torch.eye(d, device=device, dtype=torch.float64)]
+            for _ in range(H):
+                A_pows.append(A_pows[-1] @ A)
+            A_stack = torch.stack(A_pows)
+
+            ZIR = torch.einsum('kij,j->ki', A_stack[1:], z0)
+
+            row_idx    = torch.arange(H, device=device).unsqueeze(1)
+            col_idx    = torch.arange(H, device=device).unsqueeze(0)
+            power_idx  = (row_idx - col_idx).clamp(min=0)
+            causal     = (row_idx >= col_idx).to(torch.float64)
+            W_blocks   = A_stack[power_idx] * causal.unsqueeze(-1).unsqueeze(-1)
+            W_toeplitz = W_blocks.permute(0, 2, 1, 3).reshape(H * d, H * d)
+
+            gammas = (self.gamma ** torch.arange(1, H + 1, device=device,
+                                                 dtype=torch.float64)).unsqueeze(1)
+
+        for _ in range(self.plan_iters):
+            opt.zero_grad()
+            u      = torch.tanh(u_logits)
+            X_flat = (u @ B.T).reshape(H * d, 1)
+            Z      = ZIR + (W_toeplitz @ X_flat).reshape(H, d)
+            Z32    = Z.to(torch.float32)
+            if self.cumulative:
+                loss = -(gammas * agent.v_net(Z32)).sum()
+            else:
+                loss = -agent.v_net(Z32[-1]).unsqueeze(0).mean()
+            (grad_u,) = torch.autograd.grad(loss, u_logits, only_inputs=True)
+            u_logits.grad = grad_u
+            opt.step()
+
+        self._u_logits = u_logits.detach()
+        self._opt      = opt
+        with torch.no_grad():
+            return (torch.tanh(u_logits[0]) * self.action_scale).to(torch.float32).cpu().numpy()
+
+
 def plan_action_toeplitz_continuous(
     agent,
     state:        np.ndarray,
@@ -417,11 +524,12 @@ def plan_action_toeplitz_continuous(
     with torch.no_grad():
         z0 = agent.encoder(
             torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(device)
-        ).squeeze(0)  # [d]
+        ).squeeze(0).to(torch.float64)  # [d]
 
-        A = agent.A.detach()
+        A = agent.A.detach().to(torch.float64)
+        B = agent.B.detach().to(torch.float64)  # [d, action_dim]
 
-        A_pows = [torch.eye(d, device=device)]
+        A_pows = [torch.eye(d, device=device, dtype=torch.float64)]
         for _ in range(horizon):
             A_pows.append(A_pows[-1] @ A)
         A_stack = torch.stack(A_pows)  # [H+1, d, d]
@@ -431,41 +539,41 @@ def plan_action_toeplitz_continuous(
         row_idx   = torch.arange(horizon, device=device).unsqueeze(1)
         col_idx   = torch.arange(horizon, device=device).unsqueeze(0)
         power_idx = (row_idx - col_idx).clamp(min=0)
-        causal    = (row_idx >= col_idx).float()
+        causal    = (row_idx >= col_idx).to(torch.float64)
         W_blocks  = A_stack[power_idx] * causal.unsqueeze(-1).unsqueeze(-1)
         W_toeplitz = W_blocks.permute(0, 2, 1, 3).reshape(horizon * d, horizon * d)
 
-        gammas = (gamma ** torch.arange(1, horizon + 1, device=device)).unsqueeze(1)
+        gammas = (gamma ** torch.arange(1, horizon + 1, device=device,
+                                        dtype=torch.float64)).unsqueeze(1)
 
-    B = agent.B.detach()  # [d, action_dim]
-
-    u_logits = torch.randn(horizon, action_dim, device=device) * 1e-4
+    u_logits = torch.randn(horizon, action_dim, device=device,
+                           dtype=torch.float64) * 1e-4
     u_logits.requires_grad_(True)
     opt = optim.Adam([u_logits], lr=lr)
 
     for _ in range(plan_iters):
         opt.zero_grad()
 
-        u      = torch.tanh(u_logits)           # [H, action_dim]
+        u      = torch.tanh(u_logits)           # [H, action_dim] float64
         X      = u @ B.T                         # [H, d]
         X_flat = X.reshape(horizon * d, 1)
 
         ZSR  = (W_toeplitz @ X_flat).reshape(horizon, d)
-        Z    = ZIR + ZSR                         # [H, d]
+        Z    = ZIR + ZSR                         # [H, d] float64
 
-        # Terminal-only: less prone to value overestimation during data collection.
-        # Cumulative: richer signal, better at eval once V is well-calibrated.
+        # v_net expects float32 — cast Z for the forward pass only
+        Z32 = Z.to(torch.float32)
         if cumulative:
-            loss = -(gammas * agent.v_net(Z)).sum()
+            loss = -(gammas * agent.v_net(Z32)).sum()
         else:
-            loss = -agent.v_net(Z[-1]).unsqueeze(0).mean()
+            loss = -agent.v_net(Z32[-1]).unsqueeze(0).mean()
 
         (grad_u,) = torch.autograd.grad(loss, u_logits, only_inputs=True)
         u_logits.grad = grad_u
         opt.step()
 
     with torch.no_grad():
-        return (torch.tanh(u_logits[0]) * action_scale).cpu().numpy()
+        return (torch.tanh(u_logits[0]) * action_scale).to(torch.float32).cpu().numpy()
 
 
 def plan_action_continuous(

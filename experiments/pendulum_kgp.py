@@ -15,6 +15,7 @@ Success criterion: episode returns consistently above -300 in 20k steps.
 
 import argparse
 import os
+import random
 import sys
 import time
 from pathlib import Path
@@ -48,7 +49,7 @@ KOOP_LR_SCALE = 0.5
 BATCH_SIZE   = 256
 BUFFER_SIZE  = 100_000
 N_STEPS      = 20_000
-WARMUP       = 2_000
+WARMUP       = 10_000
 NOISE_START  = 1.0
 NOISE_END    = 0.1
 NOISE_DECAY  = 15_000
@@ -69,6 +70,37 @@ N_DISC_ACTIONS = 9   # torque levels uniformly spaced in [-ACTION_SCALE, ACTION_
 N_EVAL_PLAN    = 20  # episodes per planner in the speed/quality benchmark
 
 os.makedirs(VIZ_DIR, exist_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# Ornstein-Uhlenbeck noise
+# ---------------------------------------------------------------------------
+
+class OUNoise:
+    """
+    Ornstein-Uhlenbeck process: dx = θ(μ - x)dt + σ dW
+
+    Produces temporally correlated noise that mean-reverts to μ=0.
+    Compared to i.i.d. Gaussian noise, OU generates smoother action
+    trajectories that explore contiguous regions of the state space —
+    important for pendulum swing-up where sustained torque in one
+    direction is needed to build momentum.
+
+    sigma decays externally by passing sigma= on each call to sample().
+    """
+    def __init__(self, size: int, theta: float = 0.15, dt: float = 0.05):
+        self.size  = size
+        self.theta = theta
+        self.dt    = dt
+        self.state = np.zeros(size, dtype=np.float32)
+
+    def reset(self):
+        self.state[:] = 0.0
+
+    def sample(self, sigma: float) -> np.ndarray:
+        self.state += -self.theta * self.state * self.dt + \
+                      sigma * np.sqrt(self.dt) * np.random.randn(self.size).astype(np.float32)
+        return self.state.copy()
 
 
 # ---------------------------------------------------------------------------
@@ -765,7 +797,8 @@ def _save_live_plot(episode_returns, koop_log, v_log, step, ortho_err,
 
 def run_continuous_toeplitz(device: torch.device, n_steps: int = N_STEPS,
                             cumulative: bool = False, sequential: bool = False,
-                            frozen_b: bool = False):
+                            frozen_b: bool = False, seed: int = 0,
+                            ou_noise: bool = False):
     """
     Train KoopmanGradientPlanner on Pendulum-v1 with continuous torque actions
     and ortho_a=True (SVD Procrustes on CUDA → exact A ∈ O(d), linear dynamics).
@@ -775,7 +808,15 @@ def run_continuous_toeplitz(device: torch.device, n_steps: int = N_STEPS,
     over N_EVAL_PLAN episodes each, reporting quality (mean return) and wall time.
     """
     from sheaf_rl.model import KoopmanGradientPlanner, TargetNetwork
-    from sheaf_rl.planner import plan_action_continuous, plan_action_toeplitz_continuous
+    from sheaf_rl.planner import (plan_action_continuous,
+                                   plan_action_toeplitz_continuous,
+                                   WarmStartToeplitzPlanner)
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
     env    = gym.make("Pendulum-v1")
     agent  = KoopmanGradientPlanner(state_dim=STATE_DIM, d=D,
@@ -798,11 +839,21 @@ def run_continuous_toeplitz(device: torch.device, n_steps: int = N_STEPS,
     target.encoder.to(device)
     target.v_net.to(device)
 
+    planner_tag = "seq" if sequential else "toe"
+    if sequential and frozen_b:
+        planner_tag = "seq_frozb"
+    if not sequential and cumulative:
+        planner_tag = "toe_cumul"
+    noise_tag = "_ou" if ou_noise else ""
+    run_tag  = f"{planner_tag}{noise_tag}_s{seed}"
+    live_png = f"pendulum_live_{run_tag}.png"
+
     print("=" * 64)
     print("  Pendulum-v1 — Continuous Koopman + Toeplitz planner test")
     print(f"  device={device}  hard_ortho={agent._use_hard_ortho}")
     print(f"  action_dim={ACTION_DIM}  d={D}  steps={n_steps:,}")
     print(f"  ortho_a=True → linear dynamics (no L2 normalisation)")
+    print(f"  run_tag={run_tag}")
     print("=" * 64)
     print(f"\n[Warmup: {WARMUP} random steps...]\n")
 
@@ -811,6 +862,10 @@ def run_continuous_toeplitz(device: torch.device, n_steps: int = N_STEPS,
     episode_returns = []
     koop_log, v_log = [], []
     recent_koop, recent_v = [], []
+    ou = OUNoise(ACTION_DIM) if ou_noise else None
+    warm_planner = None
+    best_ret     = -float("inf")
+    best_ckpt    = os.path.join(VIZ_DIR, f"kgp_pendulum_{run_tag}_best.pt")
     t0 = time.time()
 
     for step in range(1, n_steps + 1):
@@ -831,9 +886,9 @@ def run_continuous_toeplitz(device: torch.device, n_steps: int = N_STEPS,
                     gamma=GAMMA, action_scale=ACTION_SCALE,
                     cumulative=cumulative,
                 )
-            action = np.clip(action + np.random.normal(0, noise * ACTION_SCALE,
-                                                       size=action.shape),
-                             -ACTION_SCALE, ACTION_SCALE)
+            exploration = (ou.sample(sigma=noise * ACTION_SCALE) if ou_noise
+                           else np.random.normal(0, noise * ACTION_SCALE, size=action.shape))
+            action = np.clip(action + exploration, -ACTION_SCALE, ACTION_SCALE)
 
         next_state, reward, terminated, truncated, _ = env.step(action)
         done = terminated or truncated
@@ -844,6 +899,10 @@ def run_continuous_toeplitz(device: torch.device, n_steps: int = N_STEPS,
             episode_returns.append(ep_return)
             ep_return = 0.0
             state, _ = env.reset()
+            if ou is not None:
+                ou.reset()
+            if warm_planner is not None:
+                warm_planner.reset()
         else:
             state = next_state
 
@@ -895,15 +954,23 @@ def run_continuous_toeplitz(device: torch.device, n_steps: int = N_STEPS,
             mk = np.mean(recent_koop); mv = np.mean(recent_v)
             koop_log.append(mk); v_log.append(mv)
             recent20 = episode_returns[-20:] if episode_returns else []
+            ret20    = np.mean(recent20) if recent20 else float("nan")
             ortho_err = agent.ortho_error()
             print(f"  step {step:5d}  noise={noise:.3f}  L_koop={mk:.4f}  L_v={mv:.4f}"
-                  f"  ret/20={np.mean(recent20) if recent20 else float('nan'):7.1f}"
+                  f"  ret/20={ret20:7.1f}"
                   f"  ‖AᵀA-I‖²={ortho_err:.1e}  sps={1000/elapsed:.0f}", flush=True)
             recent_koop.clear(); recent_v.clear()
 
+            if ret20 > best_ret:
+                best_ret = ret20
+                save_checkpoint(agent, target, episode_returns, koop_log, v_log,
+                                best_ret, path=best_ckpt)
+                print(f"  [best] ret/20={best_ret:.1f} → {best_ckpt}", flush=True)
+
         if step % VIZ_EVERY == 0:
             _save_live_plot(episode_returns, koop_log, v_log, step,
-                            agent.ortho_error(), agent=agent, buf=buf)
+                            agent.ortho_error(), agent=agent, buf=buf,
+                            path=live_png)
 
     env.close()
 
@@ -942,9 +1009,9 @@ def run_continuous_toeplitz(device: torch.device, n_steps: int = N_STEPS,
     eval_env.close()
     save_checkpoint(agent, target, episode_returns, koop_log, v_log,
                     np.mean(episode_returns[-20:]) if episode_returns else float("nan"),
-                    path=os.path.join(VIZ_DIR, "kgp_pendulum_toeplitz.pt"))
+                    path=os.path.join(VIZ_DIR, f"kgp_pendulum_{run_tag}.pt"))
     _save_live_plot(episode_returns, koop_log, v_log, n_steps,
-                    agent.ortho_error(), agent=agent, buf=buf)
+                    agent.ortho_error(), agent=agent, buf=buf, path=live_png)
     plot_final_summary(agent, episode_returns, buf)
 
 
@@ -962,6 +1029,9 @@ if __name__ == "__main__":
                         help="Use sequential planner for data collection (default: Toeplitz)")
     parser.add_argument("--frozen_b", action="store_true",
                         help="Detach B in sequential planner (isolates live-vs-frozen-B hypothesis)")
+    parser.add_argument("--ou_noise", action="store_true",
+                        help="Use Ornstein-Uhlenbeck noise instead of i.i.d. Gaussian")
+    parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--steps", type=int, default=N_STEPS)
     parser.add_argument("--device", default="auto")
     args = parser.parse_args()
@@ -973,7 +1043,8 @@ if __name__ == "__main__":
 
     if args.toeplitz:
         run_continuous_toeplitz(_dev, n_steps=args.steps, cumulative=args.cumulative,
-                                sequential=args.sequential, frozen_b=args.frozen_b)
+                                sequential=args.sequential, frozen_b=args.frozen_b,
+                                seed=args.seed, ou_noise=args.ou_noise)
         sys.exit(0)
 
     device = torch.device("cpu")
