@@ -17,6 +17,7 @@ import argparse
 import os
 import random
 import sys
+import threading
 import time
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -69,6 +70,7 @@ CKPT_DIR         = "output/checkpoints/pendulum"
 # Discrete-action Toeplitz test
 N_DISC_ACTIONS = 9   # torque levels uniformly spaced in [-ACTION_SCALE, ACTION_SCALE]
 N_EVAL_PLAN    = 20  # episodes per planner in the speed/quality benchmark
+N_ENVS         = 8   # parallel envs for vectorised collection (must divide 1k/5k/10k/20k)
 
 os.makedirs(VIZ_DIR,  exist_ok=True)
 os.makedirs(CKPT_DIR, exist_ok=True)
@@ -128,6 +130,32 @@ def save_checkpoint(agent, target, episode_returns, koop_log, v_log,
         },
     }, path)
     print(f"  [ckpt] {path}")
+
+
+def _save_checkpoint_async(agent, target, episode_returns, koop_log, v_log,
+                           mean_eval_return, path):
+    """Non-blocking checkpoint: snapshot state dicts then write in a daemon thread."""
+    agent_sd = {k: v.cpu().clone() for k, v in agent.state_dict().items()}
+    enc_sd   = {k: v.cpu().clone() for k, v in target.encoder.state_dict().items()}
+    v_sd     = {k: v.cpu().clone() for k, v in target.v_net.state_dict().items()}
+    payload  = {
+        "agent_state_dict": agent_sd,
+        "target_encoder":   enc_sd,
+        "target_v_net":     v_sd,
+        "episode_returns":  list(episode_returns),
+        "koop_log":         list(koop_log),
+        "v_log":            list(v_log),
+        "config": {
+            "state_dim": STATE_DIM, "action_dim": ACTION_DIM,
+            "d": D, "n_steps": N_STEPS, "gamma": GAMMA,
+            "reward_scale": REWARD_SCALE,
+            "mean_eval_return": mean_eval_return,
+        },
+    }
+    def _write():
+        torch.save(payload, path)
+        print(f"  [ckpt] {path}")
+    threading.Thread(target=_write, daemon=True).start()
 
 
 def load_checkpoint(path=None):
@@ -395,9 +423,15 @@ def plot_dashboard(agent, episode_returns, koop_log, v_log, buf, step):
     ax.legend(fontsize=8)
 
     # ── [0,2] Value heatmap V(θ, θ̇) ────────────────────────────────────────
-    ax = fig.add_subplot(gs[0, 2])
+    # Pre-compute once; reused by gs[1,1] below
     try:
-        theta_g, tdot_g, V_grid = _value_grid(agent)
+        _vg = _value_grid(agent)
+    except Exception:
+        _vg = None
+
+    ax = fig.add_subplot(gs[0, 2])
+    if _vg is not None:
+        theta_g, tdot_g, V_grid = _vg
         im = ax.imshow(
             V_grid,
             extent=[-np.pi, np.pi, -8, 8],
@@ -405,15 +439,12 @@ def plot_dashboard(agent, episode_returns, koop_log, v_log, buf, step):
             cmap="viridis",
         )
         plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-        ax.set_xlabel("θ (rad)")
-        ax.set_ylabel("θ̇ (rad/s)")
-        ax.set_title("Value Function V(θ, θ̇)")
         ax.axvline(0, color="white", lw=0.8, alpha=0.5)   # θ=0 = upright
         ax.set_xticks([-np.pi, -np.pi/2, 0, np.pi/2, np.pi])
         ax.set_xticklabels(["-π", "-π/2", "0", "π/2", "π"])
-    except Exception as e:
-        ax.text(0.5, 0.5, f"value grid failed\n{e}", ha="center", va="center",
-                transform=ax.transAxes)
+    ax.set_xlabel("θ (rad)")
+    ax.set_ylabel("θ̇ (rad/s)")
+    ax.set_title("Value Function V(θ, θ̇)")
 
     # ── [1,0] State visitation scatter ──────────────────────────────────────
     ax = fig.add_subplot(gs[1, 0])
@@ -435,7 +466,9 @@ def plot_dashboard(agent, episode_returns, koop_log, v_log, buf, step):
     # ── [1,1] Plans overlay on value heatmap ────────────────────────────────
     ax = fig.add_subplot(gs[1, 1])
     try:
-        theta_g, tdot_g, V_grid = _value_grid(agent)
+        if _vg is None:
+            raise RuntimeError("value grid unavailable")
+        theta_g, tdot_g, V_grid = _vg
         ax.imshow(V_grid, extent=[-np.pi, np.pi, -8, 8],
                   aspect="auto", origin="lower", cmap="viridis", alpha=0.75)
         ax.axvline(0, color="white", lw=0.8, alpha=0.4)
@@ -724,32 +757,33 @@ def _save_live_plot(episode_returns, koop_log, v_log, step, ortho_err,
     ax.set_ylim(0, 105); ax.set_title("Solve Rate (ret>−300, MA-30)")
     ax.set_xlabel("Episode"); ax.set_ylabel("%"); ax.grid(alpha=0.3)
 
-    # ── [1,0] Value heatmap V(θ, θ̇) ─────────────────────────────────────────
-    ax = axes[1, 0]
+    # Pre-compute value grid once (shared across all three bottom panels)
+    _vg = None
     if agent is not None:
         try:
-            theta_g, tdot_g, V_grid = _value_grid(agent)
-            im = ax.imshow(V_grid, extent=[-np.pi, np.pi, -8, 8],
-                           aspect="auto", origin="lower", cmap="viridis")
-            plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-            ax.axvline(0, color="white", lw=0.8, alpha=0.5)
-            ax.set_xticks([-np.pi, -np.pi/2, 0, np.pi/2, np.pi])
-            ax.set_xticklabels(["-π", "-π/2", "0", "π/2", "π"])
-        except Exception as e:
-            ax.text(0.5, 0.5, str(e), ha="center", va="center",
-                    transform=ax.transAxes, fontsize=8)
+            _vg = _value_grid(agent)
+        except Exception:
+            pass
+
+    # ── [1,0] Value heatmap V(θ, θ̇) ─────────────────────────────────────────
+    ax = axes[1, 0]
+    if _vg is not None:
+        theta_g, tdot_g, V_grid = _vg
+        im = ax.imshow(V_grid, extent=[-np.pi, np.pi, -8, 8],
+                       aspect="auto", origin="lower", cmap="viridis")
+        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        ax.axvline(0, color="white", lw=0.8, alpha=0.5)
+        ax.set_xticks([-np.pi, -np.pi/2, 0, np.pi/2, np.pi])
+        ax.set_xticklabels(["-π", "-π/2", "0", "π/2", "π"])
     ax.set_title("Value Function V(θ, θ̇)")
     ax.set_xlabel("θ (rad)"); ax.set_ylabel("θ̇ (rad/s)")
 
     # ── [1,1] State visitation on phase portrait ──────────────────────────────
     ax = axes[1, 1]
-    if agent is not None:
-        try:
-            theta_g, tdot_g, V_grid = _value_grid(agent)
-            ax.imshow(V_grid, extent=[-np.pi, np.pi, -8, 8],
-                      aspect="auto", origin="lower", cmap="viridis", alpha=0.55)
-        except Exception:
-            pass
+    if _vg is not None:
+        theta_g, tdot_g, V_grid = _vg
+        ax.imshow(V_grid, extent=[-np.pi, np.pi, -8, 8],
+                  aspect="auto", origin="lower", cmap="viridis", alpha=0.55)
     if buf is not None and buf.size > 0:
         s_sub  = buf.states[:buf.size]
         th, td = _to_theta_thetadot(s_sub)
@@ -762,14 +796,11 @@ def _save_live_plot(episode_returns, koop_log, v_log, step, ortho_err,
 
     # ── [1,2] Planned trajectories (Toeplitz decoded) ────────────────────────
     ax = axes[1, 2]
-    if agent is not None:
-        try:
-            theta_g, tdot_g, V_grid = _value_grid(agent)
-            ax.imshow(V_grid, extent=[-np.pi, np.pi, -8, 8],
-                      aspect="auto", origin="lower", cmap="viridis", alpha=0.6)
-            ax.axvline(0, color="white", lw=0.8, alpha=0.4)
-        except Exception:
-            pass
+    if _vg is not None:
+        theta_g, tdot_g, V_grid = _vg
+        ax.imshow(V_grid, extent=[-np.pi, np.pi, -8, 8],
+                  aspect="auto", origin="lower", cmap="viridis", alpha=0.6)
+        ax.axvline(0, color="white", lw=0.8, alpha=0.4)
         starts = [
             ("hang",  np.array([-1.0,  0.0,  0.0], np.float32)),
             ("+π/2",  np.array([ 0.0,  1.0,  2.0], np.float32)),
@@ -820,7 +851,7 @@ def run_continuous_toeplitz(device: torch.device, n_steps: int = N_STEPS,
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-    env    = gym.make("Pendulum-v1")
+    env    = gym.make_vec("Pendulum-v1", num_envs=N_ENVS)   # N_ENVS parallel envs
     agent  = KoopmanGradientPlanner(state_dim=STATE_DIM, d=D,
                                     n_actions=ACTION_DIM,
                                     ortho_a=True, device=device)
@@ -853,70 +884,74 @@ def run_continuous_toeplitz(device: torch.device, n_steps: int = N_STEPS,
     print("=" * 64)
     print("  Pendulum-v1 — Continuous Koopman + Toeplitz planner test")
     print(f"  device={device}  hard_ortho={agent._use_hard_ortho}")
-    print(f"  action_dim={ACTION_DIM}  d={D}  steps={n_steps:,}")
+    print(f"  action_dim={ACTION_DIM}  d={D}  steps={n_steps:,}  envs={N_ENVS}")
     print(f"  ortho_a=True → linear dynamics (no L2 normalisation)")
     print(f"  run_tag={run_tag}")
     print("=" * 64)
     print(f"\n[Warmup: {WARMUP} random steps...]\n")
 
-    state, _ = env.reset()
-    ep_return = 0.0
+    states, _ = env.reset()                          # [N_ENVS, STATE_DIM]
+    ep_returns = np.zeros(N_ENVS, dtype=np.float32)
     episode_returns = []
     koop_log, v_log = [], []
     recent_koop, recent_v = [], []
-    ou = OUNoise(ACTION_DIM) if ou_noise else None
-    warm_planner = None
-    best_ret     = -float("inf")
-    best_ckpt    = os.path.join(CKPT_DIR, f"kgp_pendulum_{run_tag}_best.pt")
+    ou_list  = [OUNoise(ACTION_DIM) for _ in range(N_ENVS)] if ou_noise else None
+    best_ret = -float("inf")
+    best_ckpt = os.path.join(CKPT_DIR, f"kgp_pendulum_{run_tag}_best.pt")
     t0 = time.time()
 
-    for step in range(1, n_steps + 1):
+    # env_step counts total environment steps; each loop iteration adds N_ENVS
+    for env_step in range(N_ENVS, n_steps + 1, N_ENVS):
         noise = max(NOISE_END,
-                    NOISE_START - (NOISE_START - NOISE_END) * max(0, step - WARMUP) / NOISE_DECAY)
+                    NOISE_START - (NOISE_START - NOISE_END) * max(0, env_step - WARMUP) / NOISE_DECAY)
 
-        if step < WARMUP:
-            action = np.random.uniform(-ACTION_SCALE, ACTION_SCALE, (ACTION_DIM,))
+        if env_step <= WARMUP:
+            actions = np.random.uniform(-ACTION_SCALE, ACTION_SCALE,
+                                        (N_ENVS, ACTION_DIM)).astype(np.float32)
         else:
             if sequential:
-                action = agent.act_plan_continuous(
-                    state, horizon=PLAN_HORIZON, plan_iters=PLAN_ITERS,
-                    action_scale=ACTION_SCALE, frozen_b=frozen_b,
-                )
+                acts = [agent.act_plan_continuous(
+                            states[i], horizon=PLAN_HORIZON, plan_iters=PLAN_ITERS,
+                            action_scale=ACTION_SCALE, frozen_b=frozen_b)
+                        for i in range(N_ENVS)]
             else:
-                action = agent.act_plan_toeplitz_continuous(
-                    state, horizon=PLAN_HORIZON, plan_iters=PLAN_ITERS,
-                    gamma=GAMMA, action_scale=ACTION_SCALE,
-                    cumulative=cumulative,
-                )
-            exploration = (ou.sample(sigma=noise * ACTION_SCALE) if ou_noise
-                           else np.random.normal(0, noise * ACTION_SCALE, size=action.shape))
-            action = np.clip(action + exploration, -ACTION_SCALE, ACTION_SCALE)
+                acts = [agent.act_plan_toeplitz_continuous(
+                            states[i], horizon=PLAN_HORIZON, plan_iters=PLAN_ITERS,
+                            gamma=GAMMA, action_scale=ACTION_SCALE,
+                            cumulative=cumulative)
+                        for i in range(N_ENVS)]
+            actions = np.stack(acts)  # [N_ENVS, ACTION_DIM]
+            if ou_noise:
+                exploration = np.stack([ou_list[i].sample(sigma=noise * ACTION_SCALE)
+                                        for i in range(N_ENVS)])
+            else:
+                exploration = np.random.normal(0, noise * ACTION_SCALE, size=actions.shape)
+            actions = np.clip(actions + exploration, -ACTION_SCALE, ACTION_SCALE).astype(np.float32)
 
-        next_state, reward, terminated, truncated, _ = env.step(action)
-        done = terminated or truncated
-        buf.push(state, action, reward, next_state, done)
-        ep_return += reward
-
-        if done:
-            episode_returns.append(ep_return)
-            ep_return = 0.0
-            state, _ = env.reset()
-            if ou is not None:
-                ou.reset()
-            if warm_planner is not None:
-                warm_planner.reset()
-        else:
-            state = next_state
+        next_states, rewards, terminated, truncated, infos = env.step(actions)
+        dones = terminated | truncated
+        for i in range(N_ENVS):
+            # gymnasium auto-resets done envs; the final obs before reset is in infos
+            ns_i = (infos["final_observation"][i]
+                    if dones[i] and "final_observation" in infos
+                    else next_states[i])
+            buf.push(states[i], actions[i], rewards[i], ns_i, dones[i])
+            ep_returns[i] += rewards[i]
+            if dones[i]:
+                episode_returns.append(float(ep_returns[i]))
+                ep_returns[i] = 0.0
+                if ou_list is not None:
+                    ou_list[i].reset()
+        states = next_states
 
         if buf.size < BATCH_SIZE:
             continue
 
         batch = buf.sample(BATCH_SIZE)
-        s_b   = torch.from_numpy(batch["states"]).to(device)
-        ns_b  = torch.from_numpy(batch["next_s"]).to(device)
-        a_b   = torch.from_numpy(batch["actions"]).to(device)   # [Bs, ACTION_DIM]
-        r_b   = torch.from_numpy(batch["rewards"]).to(device)
-        d_b   = torch.from_numpy(batch["dones"]).to(device)
+        s_b, ns_b, a_b, r_b, d_b = (
+            torch.as_tensor(batch[k], device=device)
+            for k in ("states", "next_s", "actions", "rewards", "dones")
+        )
 
         z_src = agent.encode(s_b)
         with torch.no_grad():
@@ -951,26 +986,26 @@ def run_continuous_toeplitz(device: torch.device, n_steps: int = N_STEPS,
         recent_koop.append(L_koop.item())
         recent_v.append(L_v.item())
 
-        if step % 1_000 == 0:
+        if env_step % 1_000 == 0:
             elapsed = time.time() - t0; t0 = time.time()
             mk = np.mean(recent_koop); mv = np.mean(recent_v)
             koop_log.append(mk); v_log.append(mv)
             recent20 = episode_returns[-20:] if episode_returns else []
             ret20    = np.mean(recent20) if recent20 else float("nan")
             ortho_err = agent.ortho_error()
-            print(f"  step {step:5d}  noise={noise:.3f}  L_koop={mk:.4f}  L_v={mv:.4f}"
+            print(f"  step {env_step:5d}  noise={noise:.3f}  L_koop={mk:.4f}  L_v={mv:.4f}"
                   f"  ret/20={ret20:7.1f}"
                   f"  ‖AᵀA-I‖²={ortho_err:.1e}  sps={1000/elapsed:.0f}", flush=True)
             recent_koop.clear(); recent_v.clear()
 
             if ret20 > best_ret:
                 best_ret = ret20
-                save_checkpoint(agent, target, episode_returns, koop_log, v_log,
-                                best_ret, path=best_ckpt)
+                _save_checkpoint_async(agent, target, episode_returns, koop_log, v_log,
+                                       best_ret, path=best_ckpt)
                 print(f"  [best] ret/20={best_ret:.1f} → {best_ckpt}", flush=True)
 
-        if step % VIZ_EVERY == 0:
-            _save_live_plot(episode_returns, koop_log, v_log, step,
+        if env_step % VIZ_EVERY == 0:
+            _save_live_plot(episode_returns, koop_log, v_log, env_step,
                             agent.ortho_error(), agent=agent, buf=buf,
                             path=live_png)
 
