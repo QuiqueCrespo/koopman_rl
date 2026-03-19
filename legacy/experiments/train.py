@@ -76,7 +76,7 @@ def train(hook=None, n_steps_override: int = None) -> dict:
             continue
 
         # ----------------------------------------------------------------
-        # Sheaf forward pass
+        # Koopman forward pass
         # ----------------------------------------------------------------
         batch = buf.sample_chunks(B, T_CHUNK)
         s_all = batch["states"]    # [B, T+1, 2]

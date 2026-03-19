@@ -63,13 +63,15 @@ VIZ_PLAN_HORIZON = 20    # longer horizon for viz plan rollouts
 VIZ_PLAN_ITERS   = 50    # more iters for viz (offline, no speed pressure)
 REWARD_SCALE     = 10.0  # divide rewards before TD: keeps V in [-150, 0] range
 VIZ_EVERY        = 5_000 # dashboard + filmstrip interval
-VIZ_DIR          = "viz_pendulum"
+VIZ_DIR          = "output/viz/pendulum"
+CKPT_DIR         = "output/checkpoints/pendulum"
 
 # Discrete-action Toeplitz test
 N_DISC_ACTIONS = 9   # torque levels uniformly spaced in [-ACTION_SCALE, ACTION_SCALE]
 N_EVAL_PLAN    = 20  # episodes per planner in the speed/quality benchmark
 
-os.makedirs(VIZ_DIR, exist_ok=True)
+os.makedirs(VIZ_DIR,  exist_ok=True)
+os.makedirs(CKPT_DIR, exist_ok=True)
 
 
 # ---------------------------------------------------------------------------
@@ -110,7 +112,7 @@ class OUNoise:
 def save_checkpoint(agent, target, episode_returns, koop_log, v_log,
                     mean_eval_return, path=None):
     """Save agent weights + training history to .pt file."""
-    path = path or os.path.join(VIZ_DIR, "kgp_pendulum.pt")
+    path = path or os.path.join(CKPT_DIR, "kgp_pendulum.pt")
     torch.save({
         "agent_state_dict": agent.state_dict(),
         "target_encoder":   target.encoder.state_dict(),
@@ -136,7 +138,7 @@ def load_checkpoint(path=None):
         agent, ckpt = load_checkpoint("viz_pendulum/kgp_pendulum.pt")
         plot_final_summary(agent, ckpt["episode_returns"], buf)
     """
-    path = path or os.path.join(VIZ_DIR, "kgp_pendulum.pt")
+    path = path or os.path.join(CKPT_DIR, "kgp_pendulum.pt")
     ckpt  = torch.load(path, map_location="cpu")
     cfg   = ckpt["config"]
     agent = KoopmanGradientPlanner(
@@ -846,7 +848,7 @@ def run_continuous_toeplitz(device: torch.device, n_steps: int = N_STEPS,
         planner_tag = "toe_cumul"
     noise_tag = "_ou" if ou_noise else ""
     run_tag  = f"{planner_tag}{noise_tag}_s{seed}"
-    live_png = f"pendulum_live_{run_tag}.png"
+    live_png = os.path.join(VIZ_DIR, f"pendulum_live_{run_tag}.png")
 
     print("=" * 64)
     print("  Pendulum-v1 — Continuous Koopman + Toeplitz planner test")
@@ -865,7 +867,7 @@ def run_continuous_toeplitz(device: torch.device, n_steps: int = N_STEPS,
     ou = OUNoise(ACTION_DIM) if ou_noise else None
     warm_planner = None
     best_ret     = -float("inf")
-    best_ckpt    = os.path.join(VIZ_DIR, f"kgp_pendulum_{run_tag}_best.pt")
+    best_ckpt    = os.path.join(CKPT_DIR, f"kgp_pendulum_{run_tag}_best.pt")
     t0 = time.time()
 
     for step in range(1, n_steps + 1):
@@ -1009,7 +1011,7 @@ def run_continuous_toeplitz(device: torch.device, n_steps: int = N_STEPS,
     eval_env.close()
     save_checkpoint(agent, target, episode_returns, koop_log, v_log,
                     np.mean(episode_returns[-20:]) if episode_returns else float("nan"),
-                    path=os.path.join(VIZ_DIR, f"kgp_pendulum_{run_tag}.pt"))
+                    path=os.path.join(CKPT_DIR, f"kgp_pendulum_{run_tag}.pt"))
     _save_live_plot(episode_returns, koop_log, v_log, n_steps,
                     agent.ortho_error(), agent=agent, buf=buf, path=live_png)
     plot_final_summary(agent, episode_returns, buf)
@@ -1199,5 +1201,5 @@ if __name__ == "__main__":
     plot_filmstrip(agent, N_STEPS, n_frames=10)
     plot_final_summary(agent, episode_returns, buf)
 
-    print(f"\nAll visualizations saved to ./{VIZ_DIR}/")
+    print(f"\nVisualizations → ./{VIZ_DIR}/   Checkpoints → ./{CKPT_DIR}/")
     env.close()

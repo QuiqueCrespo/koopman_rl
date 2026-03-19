@@ -19,9 +19,9 @@ if [[ -z "${PROJECTDIR:-}" ]]; then
 fi
 
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-LOG_DIR="$REPO_DIR/logs"
-CKPT_DIR="$REPO_DIR/checkpoints"
-VIZ_DIR="$REPO_DIR/viz_pendulum"
+LOG_DIR="$REPO_DIR/output/logs"
+CKPT_DIR="$REPO_DIR/output/checkpoints/pendulum"
+VIZ_DIR="$REPO_DIR/output/viz/pendulum"
 
 mkdir -p "$LOG_DIR" "$CKPT_DIR" "$VIZ_DIR"
 

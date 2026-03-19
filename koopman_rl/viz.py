@@ -4,12 +4,13 @@ Visualisation utilities — consolidated from plot.py and koopman_rl_directed.py
 Public API:
   goal_patch(cfg)                       → matplotlib Patch
   value_grid(agent, cfg, res=80)        → (XX, YY, V)
-  visualize_graph(graph_data, step, cfg) → saves sheaf_graph_live.png
-  plot_live(step, agent, losses, returns, cfg) → saves koopman_rl_live.png
-  plot_results(history, cfg)            → saves koopman_rl_directed_results.png
-  plot_planner_comparison(results)      → saves planner_comparison.png
+  visualize_graph(graph_data, step, cfg) → saves output/viz/gravity_basin/{run}_graph_live.png
+  plot_live(step, agent, losses, returns, cfg) → saves output/viz/gravity_basin/{run}_live.png
+  plot_results(history, cfg)            → saves output/viz/gravity_basin/{run}_results.png
+  plot_planner_comparison(results)      → saves output/viz/gravity_basin/planner_comparison.png
 """
 
+import os
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -17,6 +18,8 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
+
+_VIZ_DIR = "output/viz/gravity_basin"
 
 from koopman_rl.env import (
     GravityBasin, GOAL_X, GOAL_Y, MAX_EP_STEPS, N_ACTIONS,
@@ -74,7 +77,7 @@ _value_grid = value_grid
 
 def visualize_graph(graph_data: dict, step: int, cfg=None) -> None:
     """
-    1×2 diagnostic figure → sheaf_graph_live.png.
+    1×2 diagnostic figure → koopman_graph_live.png.
     Left:  graph topology — action-colored directed arrows, bisim bridges.
     Right: diffused values — nodes by V_diff, gold stars at reward nodes.
     """
@@ -181,7 +184,8 @@ def visualize_graph(graph_data: dict, step: int, cfg=None) -> None:
 
     plt.tight_layout()
     run = cfg.run_name if cfg else "run"
-    plt.savefig(f"{run}_graph_live.png", dpi=130, bbox_inches="tight")
+    os.makedirs(_VIZ_DIR, exist_ok=True)
+    plt.savefig(os.path.join(_VIZ_DIR, f"{run}_graph_live.png"), dpi=130, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -304,7 +308,8 @@ def plot_live(
 
     run = cfg.run_name if cfg else "run"
     plt.tight_layout()
-    plt.savefig(f"{run}_live.png", dpi=120)
+    os.makedirs(_VIZ_DIR, exist_ok=True)
+    plt.savefig(os.path.join(_VIZ_DIR, f"{run}_live.png"), dpi=120)
     plt.close(fig)
     agent.to(device)
 
@@ -398,8 +403,10 @@ def plot_results(history: dict, cfg=None) -> None:
 
     run = cfg.run_name if cfg else "run"
     plt.tight_layout()
-    plt.savefig(f"{run}_results.png", dpi=150)
-    print(f"\nSaved -> {run}_results.png")
+    os.makedirs(_VIZ_DIR, exist_ok=True)
+    out = os.path.join(_VIZ_DIR, f"{run}_results.png")
+    plt.savefig(out, dpi=150)
+    print(f"\nSaved -> {out}")
     plt.close()
 
 
@@ -428,8 +435,10 @@ def plot_planner_comparison(results: dict) -> None:
     ax.axhline(100, color="gray", linestyle="--", linewidth=0.8)
     ax.grid(axis="y", alpha=0.3)
     plt.tight_layout()
-    plt.savefig("planner_comparison.png", dpi=130)
-    print("\nSaved → planner_comparison.png")
+    os.makedirs(_VIZ_DIR, exist_ok=True)
+    out = os.path.join(_VIZ_DIR, "planner_comparison.png")
+    plt.savefig(out, dpi=130)
+    print(f"\nSaved → {out}")
     plt.close()
 
 

@@ -158,7 +158,7 @@ def diffuse_values(
     tol: float = 1e-7,
 ) -> np.ndarray:
     """
-    Run the Sheaf diffusion solver with current (detached) model parameters.
+    Run the graph diffusion solver with current (detached) model parameters.
     Returns V_diff ∈ R^9  — the diffused value targets for all states.
     """
     d         = model.d

@@ -53,7 +53,7 @@ GRAPH_REBUILD   = 500     # env steps between graph rebuilds
 K_DIFFUSE       = 300     # Richardson iterations
 ALPHA_ITERS     = 15      # power iteration steps to estimate lambda_max
 BETA_TIKHONOV   = 1e-3    # Tikhonov anchor strength in Richardson diffusion
-LAMBDA_V        = 0.5     # weight for sheaf-diffused value loss (small: L_dyn dominates)
+LAMBDA_V        = 0.5     # weight for graph-diffused value loss (small: L_dyn dominates)
 TAU_GRAPH       = 0.1     # off-policy filter temperature (lower = stricter)
 KOOP_LR_SCALE   = 0.5     # dynamics (A, B) LR = LR * KOOP_LR_SCALE
 KOOP_WD         = 0.0     # no weight decay: L_koop bounds scale naturally (no F.normalize)
@@ -492,12 +492,12 @@ def build_and_diffuse(
 
 def train() -> dict:
     """
-    Online DQN-style training with sheaf Richardson diffusion targets.
+    Online DQN-style training with graph Richardson diffusion targets.
 
     Key differences from gravity_basin.py:
       - Flat BATCH_SIZE=256 transitions per step (no chunk sampling)
       - Every GRAPH_REBUILD steps: rebuild sparse graph and diffuse
-      - L_v supervises V_ψ against sheaf-diffused values
+      - L_v supervises V_ψ against graph-diffused values
       - Two optimizer param-groups: encoder+v_net at LR, K matrices at LR*0.5
       - No Tree-Backup backward recursion
     """
@@ -678,7 +678,7 @@ def train() -> dict:
         L_v_local = (V_pred_local - y_td).pow(2).mean()
 
         # ----------------------------------------------------------------
-        # Loss 2b — Global Sheaf Diffusion
+        # Loss 2b — Global Graph Diffusion
         # Online encoder for the value loss — must match what act() uses.
         # V_ψ is trained to map online encoder embeddings to diffusion targets;
         # act() also queries V_ψ on online encoder embeddings → consistent.
@@ -690,7 +690,7 @@ def train() -> dict:
         else:
             L_v_global = torch.tensor(0.0, device=DEVICE)
 
-        # TD loss disabled — pure global sheaf diffusion only
+        # TD loss disabled — pure global graph diffusion only
         L_v = L_v_global
         # L_v = L_v_local + L_v_global
 
@@ -763,7 +763,7 @@ def train() -> dict:
 
 def visualize_graph(graph_data: dict, step: int) -> None:
     """
-    Save a 1×2 diagnostic figure to sheaf_graph_live.png.
+    Save a 1×2 diagnostic figure to koopman_graph_live.png.
     Left:  graph topology — action-colored arrows, bisim bridges, nodes by V_diff.
     Right: diffused values — W_sqrt gray edges, gold stars at reward-injection nodes.
     Called every GRAPH_REBUILD steps.
@@ -897,7 +897,7 @@ def visualize_graph(graph_data: dict, step: int) -> None:
     ax2.set_title(f"Diffused values  |  β={BETA_TIKHONOV}  K={K_DIFFUSE} iters")
 
     plt.tight_layout()
-    plt.savefig("sheaf_graph_live.png", dpi=130, bbox_inches="tight")
+    plt.savefig("koopman_graph_live.png", dpi=130, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -948,7 +948,7 @@ def plot_live(
                    label=f"μ={vd.mean():.3f}  max={vd.max():.3f}")
         ax.set_xlabel("Diffused V")
         ax.set_ylabel("Density")
-        ax.set_title("Sheaf-Diffused Value Distribution")
+        ax.set_title("Graph-Diffused Value Distribution")
         ax.legend(fontsize=9)
     else:
         if episode_returns:
@@ -1033,7 +1033,7 @@ def plot_results(history: dict) -> None:
     # ----------------------------------------------------------------
     ax = axes[0, 0]
     ax.semilogy(_smooth(koop_losses), label=r"$\mathcal{L}_{Koop}$", color="steelblue")
-    ax.semilogy(_smooth(v_losses),    label=r"$\mathcal{L}_{V}$ (sheaf diffusion)",
+    ax.semilogy(_smooth(v_losses),    label=r"$\mathcal{L}_{V}$ (graph diffusion)",
                 color="tomato")
     ax.semilogy(_smooth(bisim_losses),label=r"$\mathcal{L}_{bisim}$", color="purple")
     ax.set_xlabel("Log interval")
@@ -1067,7 +1067,7 @@ def plot_results(history: dict) -> None:
     im = ax.pcolormesh(XX, YY, V, cmap="plasma", shading="auto")
     plt.colorbar(im, ax=ax, label=r"$V_\psi(f_\theta(s))$")
     ax.add_patch(_goal_patch(label="Goal zone"))
-    ax.set_title(r"Learned Value Map $V(x,y)$  [sheaf diffusion targets]")
+    ax.set_title(r"Learned Value Map $V(x,y)$  [graph diffusion targets]")
     ax.set_xlabel("x")
     ax.set_ylabel("y")
     ax.legend(loc="lower left", fontsize=8)

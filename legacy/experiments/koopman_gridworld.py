@@ -111,7 +111,7 @@ def collect_replay_buffer(n_episodes: int = 60, max_steps: int = 80) -> list[tup
     return transitions
 
 # ---------------------------------------------------------------------------
-# 4. Incidence Matrix  B  (the heart of the sheaf)
+# 4. Incidence Matrix  B  (the heart of the Koopman graph)
 # ---------------------------------------------------------------------------
 
 def build_incidence_matrix(

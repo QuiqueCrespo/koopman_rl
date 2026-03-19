@@ -7,7 +7,7 @@ Architecture (shared):
   Observation  (7, 7, 3) uint8 partial view  →  /10.0  →  CNN encoder
   CNN          Conv(3→16,k=2) → Conv(16→32,k=2) → Conv(32→64,k=2) → Flatten → Linear(d)
   QNetwork     d → 128 → ReLU → n_actions (7)
-  Koopman      K_a ∈ R^{d×d}, one per action  [Sheaf only]
+  Koopman      K_a ∈ R^{d×d}, one per action  [Koopman-RL only]
 
 Koopman-RL     T-step backward recursion + Koopman consistency loss
 DQN          Single-step Bellman target, same network (no K_a)
@@ -308,7 +308,7 @@ class ReplayBuffer:
 
 
 # ---------------------------------------------------------------------------
-# Sheaf backward recursion (block-diagonal M solve)
+# Koopman backward recursion (block-diagonal M solve)
 # ---------------------------------------------------------------------------
 
 def compute_q_targets(
@@ -545,11 +545,11 @@ def train_koopman(cfg: dict, label: str, results_dir: pathlib.Path = None) -> di
     }
 
     if results_dir is not None:
-        model_path = results_dir / f"{label}_sheaf_model.pt"
+        model_path = results_dir / f"{label}_koopman_model.pt"
         torch.save(agent.state_dict(), model_path)
         print(f"    [saved model] {model_path}")
 
-        data_path = results_dir / f"{label}_sheaf_results.pt"
+        data_path = results_dir / f"{label}_koopman_results.pt"
         torch.save({k: v for k, v in result.items() if k != "agent"}, data_path)
         print(f"    [saved data]  {data_path}")
 
@@ -713,7 +713,7 @@ def plot_all(results: dict, env_names: list) -> None:
                  fontsize=13)
 
     for col, name in enumerate(env_names):
-        sh  = results[name]["sheaf"]
+        sh  = results[name]["koopman"]
         dq  = results[name]["dqn"]
         cfg = ENV_CONFIGS[name]
 
@@ -752,7 +752,7 @@ def print_summary(results: dict, env_names: list) -> None:
     print(hdr)
     print("  " + "-" * (len(hdr) - 2))
     for name in env_names:
-        for key, lbl in [("sheaf", "Koopman-RL"), ("dqn", "DQN")]:
+        for key, lbl in [("koopman", "Koopman-RL"), ("dqn", "DQN")]:
             hist = results[name][key]
             ret  = hist["episode_returns"]
             sr   = np.mean([r > 0 for r in ret[-100:]]) * 100 if len(ret) >= 100 else 0.0
@@ -795,12 +795,12 @@ def main():
         print(f"{'='*62}")
 
         torch.manual_seed(42); np.random.seed(42); random.seed(42)
-        sheaf_hist = train_koopman(cfg, name, results_dir=results_dir)
+        koopman_hist = train_koopman(cfg, name, results_dir=results_dir)
 
         torch.manual_seed(42); np.random.seed(42); random.seed(42)
         dqn_hist = train_dqn(cfg, name, results_dir=results_dir)
 
-        results[name] = {"sheaf": sheaf_hist, "dqn": dqn_hist}
+        results[name] = {"koopman": koopman_hist, "dqn": dqn_hist}
 
     print_summary(results, run_envs)
     plot_all(results, run_envs)
@@ -808,12 +808,12 @@ def main():
     # Save run summary JSON (no tensors — pure Python types)
     summary = {}
     for name in run_envs:
-        sh  = results[name]["sheaf"]
+        sh  = results[name]["koopman"]
         dq  = results[name]["dqn"]
         ret_s = sh["episode_returns"]
         ret_d = dq["episode_returns"]
         summary[name] = {
-            "sheaf": {
+            "koopman": {
                 "n_episodes":    len(ret_s),
                 "last100_succ":  float(np.mean([r > 0 for r in ret_s[-100:]])) if len(ret_s) >= 100 else None,
                 "ep_at_80pct":   _first_reach(ret_s),

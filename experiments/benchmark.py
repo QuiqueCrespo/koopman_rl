@@ -35,7 +35,7 @@ from gravity_basin import (
     BUFFER_SIZE, B, T_CHUNK,
 )
 
-BATCH_SIZE = B * T_CHUNK   # 256 — matches Sheaf total transitions per update
+BATCH_SIZE = B * T_CHUNK   # 256 — matches Koopman-RL total transitions per update
 
 # ---------------------------------------------------------------------------
 # DQN replay buffer (standard flat buffer, no chunk sampling needed)
@@ -120,7 +120,7 @@ def train_dqn() -> dict:
     print("  DQN Baseline — 2D Gravity Basin")
     print(f"  Network: Encoder [2→64→tanh→64→tanh→{D}] + QNet [{D}→64→ReLU→4]")
     print(f"  Target:  r + γ·max_a' Q_tgt(s',a')   [single-step Bellman]")
-    print(f"  Batch:   {BATCH_SIZE} transitions (= {B}×{T_CHUNK} Sheaf batch)")
+    print(f"  Batch:   {BATCH_SIZE} transitions (= {B}×{T_CHUNK} Koopman-RL batch)")
     print("=" * 62)
     print(f"\n[Warmup: collecting {WARMUP} random transitions...]\n")
 
@@ -207,7 +207,7 @@ def _success_curve(returns, window=50):
     return np.arange(window - 1, len(hits)), rolled
 
 
-def plot_comparison(sheaf_hist: dict, dqn_hist: dict) -> None:
+def plot_comparison(koopman_hist: dict, dqn_hist: dict) -> None:
     fig, axes = plt.subplots(1, 3, figsize=(18, 5))
     fig.suptitle("Koopman-RL vs DQN — 2D Gravity Basin\n"
                  f"Identical network, optimizer, ε-schedule, budget ({N_STEPS:,} steps)",
@@ -217,7 +217,7 @@ def plot_comparison(sheaf_hist: dict, dqn_hist: dict) -> None:
     ax = axes[0]
     w = 50
     for hist, label, color in [
-        (sheaf_hist, f"Koopman-RL  (T={T_CHUNK} multi-step + Koopman)", "royalblue"),
+        (koopman_hist, f"Koopman-RL  (T={T_CHUNK} multi-step + Koopman)", "royalblue"),
         (dqn_hist,   "DQN  (single-step Bellman)",                     "tomato"),
     ]:
         r = hist["episode_returns"]
@@ -233,7 +233,7 @@ def plot_comparison(sheaf_hist: dict, dqn_hist: dict) -> None:
     # 2. Rolling success rate
     ax = axes[1]
     for hist, label, color in [
-        (sheaf_hist, "Koopman-RL", "royalblue"),
+        (koopman_hist, "Koopman-RL", "royalblue"),
         (dqn_hist,   "DQN",      "tomato"),
     ]:
         xs, ys = _success_curve(hist["episode_returns"], window=50)
@@ -248,9 +248,9 @@ def plot_comparison(sheaf_hist: dict, dqn_hist: dict) -> None:
 
     # 3. Q-loss curves
     ax = axes[2]
-    steps_sheaf = np.arange(1, len(sheaf_hist["q_losses"]) + 1) * LOG_EVERY
+    steps_koopman = np.arange(1, len(koopman_hist["q_losses"]) + 1) * LOG_EVERY
     steps_dqn   = np.arange(1, len(dqn_hist["q_losses"])   + 1) * LOG_EVERY
-    ax.semilogy(steps_sheaf, sheaf_hist["q_losses"],
+    ax.semilogy(steps_koopman, koopman_hist["q_losses"],
                 color="royalblue", linewidth=1.5, label="Koopman-RL  $\\mathcal{L}_Q$")
     ax.semilogy(steps_dqn,   dqn_hist["q_losses"],
                 color="tomato",    linewidth=1.5, label="DQN  $\\mathcal{L}_Q$")
@@ -278,10 +278,10 @@ def main():
     # --- Koopman-RL ---
     print("\n>>> Running Koopman-RL ...\n")
     torch.manual_seed(42); np.random.seed(42); random.seed(42)
-    sheaf_hist = train_koopman()
+    koopman_hist = train_koopman()
 
-    sheaf_agent = sheaf_hist["agent"]
-    sr_s, ms_s  = evaluate(sheaf_agent, n_episodes=200)
+    koopman_agent = koopman_hist["agent"]
+    sr_s, ms_s  = evaluate(koopman_agent, n_episodes=200)
 
     # --- DQN ---
     print("\n>>> Running DQN baseline ...\n")
@@ -304,16 +304,16 @@ def main():
                 return i
         return None
 
-    fe_s = first_ep_above(sheaf_hist["episode_returns"])
+    fe_s = first_ep_above(koopman_hist["episode_returns"])
     fe_d = first_ep_above(dqn_hist["episode_returns"])
 
     print(f"  {'Final success rate (200 ep greedy)':<35} {sr_s*100:>9.1f}%  {sr_d*100:>9.1f}%")
     print(f"  {'Mean steps to goal (successes only)':<35} {ms_s:>10.1f}  {ms_d:>10.1f}")
-    print(f"  {'Training episodes':<35} {len(sheaf_hist['episode_returns']):>10}  {len(dqn_hist['episode_returns']):>10}")
-    s_succ = sum(r == 1.0 for r in sheaf_hist['episode_returns'])
+    print(f"  {'Training episodes':<35} {len(koopman_hist['episode_returns']):>10}  {len(dqn_hist['episode_returns']):>10}")
+    s_succ = sum(r == 1.0 for r in koopman_hist['episode_returns'])
     d_succ = sum(r == 1.0 for r in dqn_hist['episode_returns'])
     print(f"  {'Training successes':<35} {s_succ:>10}  {d_succ:>10}")
-    pct_s = s_succ / len(sheaf_hist['episode_returns']) * 100
+    pct_s = s_succ / len(koopman_hist['episode_returns']) * 100
     pct_d = d_succ / len(dqn_hist['episode_returns'])   * 100
     print(f"  {'Training success rate':<35} {pct_s:>9.1f}%  {pct_d:>9.1f}%")
     fe_s_str = str(fe_s) if fe_s else "never"
@@ -321,7 +321,7 @@ def main():
     print(f"  {'Episode reaching 80% success (10-ep)':<35} {fe_s_str:>10}  {fe_d_str:>10}")
     print("=" * 62)
 
-    plot_comparison(sheaf_hist, dqn_hist)
+    plot_comparison(koopman_hist, dqn_hist)
 
 
 if __name__ == "__main__":

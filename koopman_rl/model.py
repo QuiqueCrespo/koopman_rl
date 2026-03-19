@@ -131,7 +131,7 @@ class _SVDOrthogonal(nn.Module):
 
 class KoopmanGradientPlanner(nn.Module):
     """
-    Formerly KoopmanAgent. Renamed to reflect primary usage: MPC via learned
+    Formerly SheafAgent. Renamed to reflect primary usage: MPC via learned
     Koopman latent dynamics (A, B) + value network V_ψ.
 
     Latent transition model:
