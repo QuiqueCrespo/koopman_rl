@@ -872,7 +872,7 @@ def run_continuous_toeplitz(device: torch.device, n_steps: int = N_STEPS,
 
     for step in range(1, n_steps + 1):
         noise = max(NOISE_END,
-                    NOISE_START - (NOISE_START - NOISE_END) * step / NOISE_DECAY)
+                    NOISE_START - (NOISE_START - NOISE_END) * max(0, step - WARMUP) / NOISE_DECAY)
 
         if step < WARMUP:
             action = np.random.uniform(-ACTION_SCALE, ACTION_SCALE, (ACTION_DIM,))
