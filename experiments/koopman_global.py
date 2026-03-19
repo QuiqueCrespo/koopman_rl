@@ -1,15 +1,15 @@
 """
-Latent Affine Sheaf-RL: Global Richardson Diffusion ("Ferrari")
+Latent Affine Koopman-RL: Global Richardson Diffusion ("Ferrari")
 ===============================================================
 Replaces the T-step Tree-Backup chain solver with full Richardson diffusion
-over a dynamically constructed sparse sheaf graph.
+over a dynamically constructed sparse Koopman graph.
 
 Graph structure (rebuilt every GRAPH_REBUILD env steps):
   - M_SRC=512 source states + M_SRC next-states = 2*M_SRC nodes total
   - M_SRC temporal edges (src_i → dst_i) with Koopman restriction maps
   - k-NN bisimulation edges (K_BISIM_NN=5) over target-encoder embeddings
 
-Incidence matrix B encodes the sheaf Laplacian structure:
+Incidence matrix B encodes the graph Laplacian structure:
   stalk = D + 1  (D latent dimensions + 1 value slot)
   Each edge contributes two blocks to B (source restriction, dest restriction).
 
@@ -30,7 +30,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from gravity_basin import (
-    GravityBasin, Encoder, ValueNetwork, SheafAgent, TargetNetwork,
+    GravityBasin, Encoder, ValueNetwork, KoopmanAgent, TargetNetwork,
     ReplayBuffer, compute_bisimulation_loss, evaluate,
     N_ACTIONS, STATE_DIM, D, GAMMA, EMA_TAU, LR, MAX_EP_STEPS,
     LAMBDA_KOOP, LAMBDA_BISIM, BUFFER_SIZE,
@@ -64,7 +64,7 @@ EPS_START       = 1.0
 EPS_END         = 0.05
 EPS_DECAY       = 40_000
 LOG_EVERY       = 2_000
-PLOT_EVERY      = 2_000  # save live plot to sheaf_rl_live.png
+PLOT_EVERY      = 2_000  # save live plot to koopman_rl_live.png
 
 # Sparse graph ops live on CPU to avoid MPS sparse limitations.
 # Neural forward passes can use DEVICE (MPS / CUDA / CPU).
@@ -76,7 +76,7 @@ DEVICE        = (
 )
 
 # ---------------------------------------------------------------------------
-# 1–3. Message-passing Sheaf Laplacian (replaces sparse incidence matrix B)
+# 1–3. Message-passing graph Laplacian (replaces sparse incidence matrix B)
 # ---------------------------------------------------------------------------
 # Mathematical equivalence: B^T(B X) = scatter/gather over edges.
 # The B matrix has zero off-diagonal blocks between latent and value stalk
@@ -340,7 +340,7 @@ def build_incidence_coo(
 # ---------------------------------------------------------------------------
 
 def build_and_diffuse(
-    agent:        SheafAgent,
+    agent:        KoopmanAgent,
     target:       TargetNetwork,
     buf:          ReplayBuffer,
     graph_device: torch.device,   # kept for API compat; diffusion now runs on train_device
@@ -503,7 +503,7 @@ def train() -> dict:
     """
     env    = GravityBasin()
     buf    = ReplayBuffer(capacity=BUFFER_SIZE)
-    agent  = SheafAgent()
+    agent  = KoopmanAgent()
     target = TargetNetwork(agent)
 
     # Two param groups: neural params at LR, dynamics (A, B) at lower LR + WD
@@ -515,7 +515,7 @@ def train() -> dict:
     ])
 
     # Move agent and target to DEVICE for neural forward passes.
-    # Note: gravity_basin.SheafAgent.act() creates a hard-coded CPU tensor,
+    # Note: gravity_basin.KoopmanAgent.act() creates a hard-coded CPU tensor,
     # so for DEVICE != cpu we wrap act() to move the input tensor to DEVICE.
     agent.to(DEVICE)
     target.encoder.to(DEVICE)
@@ -558,7 +558,7 @@ def train() -> dict:
     t0 = time.time()
 
     print("=" * 68)
-    print("  Ferrari Sheaf-RL — Global Richardson Diffusion")
+    print("  Ferrari Koopman-RL — Global Richardson Diffusion")
     print(f"  State: (x,y)∈[-1,1]²   GravityBasin   d={D}   device={DEVICE}")
     print(f"  Graph: {2*M_SRC} nodes  |  rebuilt every {GRAPH_REBUILD} steps")
     print(f"  Diffusion: {K_DIFFUSE} Richardson iterations")
@@ -746,7 +746,7 @@ def train() -> dict:
         if step % PLOT_EVERY == 0:
             plot_live(step, agent, koop_losses, v_losses, bisim_losses,
                       episode_returns, graph_v_diff)
-            print(f"  [plot saved → sheaf_rl_live.png]")
+            print(f"  [plot saved → koopman_rl_live.png]")
 
     return {
         "agent":           agent,
@@ -909,7 +909,7 @@ def _smooth(x, w=10):
 
 def plot_live(
     step:            int,
-    agent:           "SheafAgent",
+    agent:           "KoopmanAgent",
     koop_losses:     list,
     v_losses:        list,
     bisim_losses:    list,
@@ -917,7 +917,7 @@ def plot_live(
     graph_v_diff:    "torch.Tensor | None" = None,
 ) -> None:
     """
-    Save a 2×2 monitoring figure to sheaf_rl_live.png.
+    Save a 2×2 monitoring figure to koopman_rl_live.png.
     Called every PLOT_EVERY steps during training.
     macOS Preview / most image viewers auto-refresh on file change.
     """
@@ -925,7 +925,7 @@ def plot_live(
     agent.to(cpu)   # briefly move for grid evaluation
 
     fig, axes = plt.subplots(2, 2, figsize=(14, 11))
-    fig.suptitle(f"Sheaf-RL  —  step {step:,}", fontsize=13)
+    fig.suptitle(f"Koopman-RL  —  step {step:,}", fontsize=13)
 
     # --- Loss curves ---
     ax = axes[0, 0]
@@ -1010,7 +1010,7 @@ def plot_live(
     ax.set_xlabel("PC$_1$"); ax.set_ylabel("PC$_2$")
 
     plt.tight_layout()
-    plt.savefig("sheaf_rl_live.png", dpi=120)
+    plt.savefig("koopman_rl_live.png", dpi=120)
     plt.close(fig)
 
     agent.to(DEVICE)   # move back for training
@@ -1110,8 +1110,8 @@ def plot_results(history: dict) -> None:
     ax.set_ylabel("PC$_2$")
 
     plt.tight_layout()
-    plt.savefig("sheaf_rl_global_results.png", dpi=150)
-    print("\nSaved -> sheaf_rl_global_results.png")
+    plt.savefig("koopman_global_results.png", dpi=150)
+    print("\nSaved -> koopman_global_results.png")
     plt.close()
 
 

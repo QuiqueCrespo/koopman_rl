@@ -1,5 +1,5 @@
 """
-Diagnostic hook for Sheaf-RL gravity basin training.
+Diagnostic hook for Koopman-RL gravity basin training.
 
 Records per-step health metrics covering all five identified failure modes:
   1. Train/inference normalization mismatch (F.normalize in act but not in train)
@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from env    import N_ACTIONS, STATE_DIM, GOAL_X, GOAL_Y, ACTION_NAMES, ACTION_COLORS, GravityBasin
-from model  import SheafAgent, TargetNetwork, D
+from model  import KoopmanAgent, TargetNetwork, D
 from losses import GAMMA
 
 
@@ -98,7 +98,7 @@ class DiagnosticHook:
 
     def __init__(
         self,
-        agent      : SheafAgent,
+        agent      : KoopmanAgent,
         target     : TargetNetwork,
         n_probe    : int = 256,
         probe_seed : int = 0,
@@ -443,7 +443,7 @@ class DiagnosticHook:
                                  fontsize=7, color=color)
 
         fig.suptitle(
-            "Sheaf-RL Collapse Diagnostics\n"
+            "Koopman-RL Collapse Diagnostics\n"
             "Red shading = collapse window (success peak → 50% drop)\n"
             "FM = Failure Mode (1=norm mismatch, 2=bisim, 3=K_a ortho, 4=AWR, 5=collapse)",
             fontsize=11,
@@ -544,8 +544,8 @@ def main():
     history = train(n_steps_override=10_000, hook=None)  # hook wired in train.py
 
     # Standalone: build a fresh agent and test hook construction
-    from model import SheafAgent, TargetNetwork
-    agent  = SheafAgent()
+    from model import KoopmanAgent, TargetNetwork
+    agent  = KoopmanAgent()
     target = TargetNetwork(agent)
     hook   = DiagnosticHook(agent, target, n_probe=64)
 

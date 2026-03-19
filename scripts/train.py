@@ -1,5 +1,5 @@
 """
-Train Sheaf-RL.
+Train Koopman-RL.
 
 Usage:
   python scripts/train.py
@@ -13,17 +13,17 @@ import random
 import sys
 from pathlib import Path
 
-# Add repo root to path so sheaf_rl package is importable
+# Add repo root to path so koopman_rl package is importable
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import numpy as np
 import torch
 
-from sheaf_rl.config import Config
-from sheaf_rl.algorithms import train, evaluate
-from sheaf_rl.viz import plot_results
+from koopman_rl.config import Config
+from koopman_rl.algorithms import train, evaluate
+from koopman_rl.viz import plot_results
 
-parser = argparse.ArgumentParser(description="Train Sheaf-RL")
+parser = argparse.ArgumentParser(description="Train Koopman-RL")
 parser.add_argument("--config", default="configs/base.py",
                     help="Path to config file (default: configs/base.py)")
 parser.add_argument("--seed",   type=int,  default=None, help="Override config seed")

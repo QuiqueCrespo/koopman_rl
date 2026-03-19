@@ -1,5 +1,5 @@
 """
-Visualisation utilities for the gravity basin Sheaf-RL agent.
+Visualisation utilities for the gravity basin Koopman-RL agent.
 """
 
 import numpy as np

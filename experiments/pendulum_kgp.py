@@ -34,7 +34,7 @@ import matplotlib.patches as mpatches
 from matplotlib.collections import LineCollection
 from matplotlib.gridspec import GridSpec
 
-from sheaf_rl.model import KoopmanGradientPlanner, TargetNetwork
+from koopman_rl.model import KoopmanGradientPlanner, TargetNetwork
 
 # ---------------------------------------------------------------------------
 # Config
@@ -807,8 +807,8 @@ def run_continuous_toeplitz(device: torch.device, n_steps: int = N_STEPS,
     At the end, benchmarks plan_action_continuous vs plan_action_toeplitz_continuous
     over N_EVAL_PLAN episodes each, reporting quality (mean return) and wall time.
     """
-    from sheaf_rl.model import KoopmanGradientPlanner, TargetNetwork
-    from sheaf_rl.planner import (plan_action_continuous,
+    from koopman_rl.model import KoopmanGradientPlanner, TargetNetwork
+    from koopman_rl.planner import (plan_action_continuous,
                                    plan_action_toeplitz_continuous,
                                    WarmStartToeplitzPlanner)
 

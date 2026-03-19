@@ -1,5 +1,5 @@
 """
-Sheaf-RL: Directed Latent Value Iteration (main algorithm).
+Koopman-RL: Directed Latent Value Iteration (main algorithm).
 
 Contains:
   directed_value_iteration  — max-propagation over episodic memory graph
@@ -16,10 +16,10 @@ import torch.nn.functional as F
 import torch.optim as optim
 import time
 
-from sheaf_rl.config import Config
-from sheaf_rl.env import GravityBasin
-from sheaf_rl.model import KoopmanGradientPlanner, TargetNetwork
-from sheaf_rl.buffer import ReplayBuffer
+from koopman_rl.config import Config
+from koopman_rl.env import GravityBasin
+from koopman_rl.model import KoopmanGradientPlanner, TargetNetwork
+from koopman_rl.buffer import ReplayBuffer
 
 
 # ---------------------------------------------------------------------------
@@ -191,7 +191,7 @@ def build_and_propagate(
 
 def train(cfg=None) -> dict:
     """
-    Full Sheaf-RL directed VI training loop.
+    Full Koopman-RL directed VI training loop.
 
     Accepts:
       cfg=None              → uses default Config()
@@ -259,7 +259,7 @@ def train(cfg=None) -> dict:
     t0 = time.time()
 
     print("=" * 68)
-    print("  Ferrari Sheaf-RL v2 — Directed Latent Value Iteration")
+    print("  Ferrari Koopman-RL v2 — Directed Latent Value Iteration")
     print(f"  State: (x,y)∈[-1,1]²   GravityBasin   d={m.d}   device={device}")
     print(f"  Graph: {N_nodes} nodes  |  rebuilt every {a.graph_rebuild} steps")
     print(f"  Value iter: {a.k_diffuse} directed Bellman steps")
@@ -297,7 +297,7 @@ def train(cfg=None) -> dict:
                           f"E_temp={m_src}  k-NN={min(a.k_bisim_nn, N_nodes-1)}  step={step}")
                     graph_built = True
                 try:
-                    from sheaf_rl.viz import visualize_graph
+                    from koopman_rl.viz import visualize_graph
                     visualize_graph(last_graph_data, step, cfg)
                 except Exception:
                     pass
@@ -399,7 +399,7 @@ def train(cfg=None) -> dict:
 
         if step % t.plot_every == 0:
             try:
-                from sheaf_rl.viz import plot_live
+                from koopman_rl.viz import plot_live
                 plot_live(step, agent, koop_losses, v_losses, bisim_losses,
                           episode_returns, graph_v_diff, cfg=cfg)
             except Exception:
@@ -424,7 +424,7 @@ def evaluate(agent, cfg=None, n_episodes: int = 100) -> tuple:
 
     cfg is optional — if omitted uses default EnvConfig values.
     """
-    from sheaf_rl.env import GravityBasin
+    from koopman_rl.env import GravityBasin
     env         = GravityBasin(cfg.env if cfg else None)
     max_steps   = env.max_ep_steps
     successes   = 0
@@ -452,13 +452,13 @@ def evaluate(agent, cfg=None, n_episodes: int = 100) -> tuple:
 def evaluate_planner(agent, cfg=None, n_episodes: int = 100,
                      horizon: int = 10, plan_iters: int = 20) -> dict:
     """Compare all planner variants: greedy, gumbel, softmax, shooting, beam."""
-    from sheaf_rl.planner import (
+    from koopman_rl.planner import (
         plan_action_gumbel, plan_action_gumbel_cumulative,
         plan_action_softmax, plan_action_softmax_cumulative,
         plan_action_shooting, plan_action_beam,
         plan_action_toeplitz,
     )
-    from sheaf_rl.env import GravityBasin
+    from koopman_rl.env import GravityBasin
 
     env       = GravityBasin(cfg.env if cfg else None)
     max_steps = env.max_ep_steps

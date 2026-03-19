@@ -24,7 +24,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.nn.utils.parametrize as parametrize
 
-from sheaf_rl.config import Config, ModelConfig, EnvConfig
+from koopman_rl.config import Config, ModelConfig, EnvConfig
 
 # Module-level defaults (backward compat)
 N_ACTIONS = 4
@@ -131,7 +131,7 @@ class _SVDOrthogonal(nn.Module):
 
 class KoopmanGradientPlanner(nn.Module):
     """
-    Formerly SheafAgent. Renamed to reflect primary usage: MPC via learned
+    Formerly KoopmanAgent. Renamed to reflect primary usage: MPC via learned
     Koopman latent dynamics (A, B) + value network V_ψ.
 
     Latent transition model:
@@ -198,7 +198,7 @@ class KoopmanGradientPlanner(nn.Module):
         """
         One Koopman step: z' = A z + b_vec  [+ optional normalisation].
 
-        ortho_a=False: normalises z' to S^{d-1} (original sheaf approach).
+        ortho_a=False: normalises z' to S^{d-1} (original Koopman approach).
         ortho_a=True:  fully linear — no normalisation. A is orthonormal so
                        ||A z|| = ||z||; only B a perturbs the norm.
 
@@ -261,7 +261,7 @@ class KoopmanGradientPlanner(nn.Module):
                           horizon: int = 10, plan_iters: int = 20,
                           tau: float = 1.0) -> int:
         """Gumbel-Softmax MPC — discrete environments."""
-        from sheaf_rl.planner import plan_action_gumbel
+        from koopman_rl.planner import plan_action_gumbel
         return plan_action_gumbel(self, state, horizon, plan_iters, tau=tau)
 
     def act_plan_toeplitz(self, state: np.ndarray,
@@ -271,7 +271,7 @@ class KoopmanGradientPlanner(nn.Module):
         """Block-Toeplitz GEMM planner — requires ortho_a=True.
         Pre-computes ZIR and W_toeplitz outside the Adam loop; each iteration
         is a single dense GEMM instead of H sequential dyn_step calls."""
-        from sheaf_rl.planner import plan_action_toeplitz
+        from koopman_rl.planner import plan_action_toeplitz
         return plan_action_toeplitz(self, state, horizon, plan_iters,
                                     lr=lr, tau=tau, gamma=gamma)
 
@@ -280,7 +280,7 @@ class KoopmanGradientPlanner(nn.Module):
                             action_scale: float = 1.0,
                             frozen_b: bool = False) -> np.ndarray:
         """tanh-squash MPC — continuous environments. Returns action ∈ [-scale, scale]^d."""
-        from sheaf_rl.planner import plan_action_continuous
+        from koopman_rl.planner import plan_action_continuous
         return plan_action_continuous(self, state, horizon, plan_iters,
                                       frozen_b=frozen_b) * action_scale
 
@@ -291,14 +291,14 @@ class KoopmanGradientPlanner(nn.Module):
         """Block-Toeplitz GEMM MPC — continuous environments, requires ortho_a=True.
         cumulative=False uses terminal V only (stable for data collection);
         cumulative=True uses discounted sum over horizon (better at eval)."""
-        from sheaf_rl.planner import plan_action_toeplitz_continuous
+        from koopman_rl.planner import plan_action_toeplitz_continuous
         return plan_action_toeplitz_continuous(self, state, horizon, plan_iters,
                                                gamma=gamma, action_scale=action_scale,
                                                cumulative=cumulative)
 
 
-# Backward-compatibility alias for any existing saved checkpoints or notebooks
-SheafAgent = KoopmanGradientPlanner
+# Backward-compatibility alias: KoopmanAgent is an alias for KoopmanGradientPlanner
+KoopmanAgent = KoopmanGradientPlanner
 
 
 class TargetNetwork:

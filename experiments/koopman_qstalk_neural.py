@@ -1,13 +1,13 @@
 """
-Latent Affine Sheaf-RL: Neural Q-Stalk (3x3 Grid World)
+Latent Affine Koopman-RL: Neural Q-Stalk (3x3 Grid World)
 ========================================================
 Combines the Q-stalk structural fix with learned neural components.
 
-Two changes from sheaf_rl_qstalk.py (tabular):
+Two changes from koopman_rl_qstalk.py (tabular):
   1. Encoder f_θ  — one_hot(s) → z ∈ R^d   (replaces fixed one-hot identity)
   2. Koopman K_a  — learned d×d matrices     (replaces hard-coded permutations)
 
-Two changes from sheaf_rl_neural.py (V-stalk neural):
+Two changes from koopman_rl_neural.py (V-stalk neural):
   3. QNetwork Q_ψ — z → R^|A|               (replaces scalar ValueNetwork)
   4. Q-evaluation — directed sparse solve    (replaces Richardson / symmetric Δ_F)
 
@@ -88,7 +88,7 @@ class QNetwork(nn.Module):
     """
     Q_ψ: z ∈ R^d → q ∈ R^|A|
 
-    Replaces the scalar ValueNetwork from sheaf_rl_neural.py.
+    Replaces the scalar ValueNetwork from koopman_rl_neural.py.
     Output q[a] = Q(s, a) for every action simultaneously.
     V*(s) = max_a Q_ψ(f_θ(s))[a] — no separate value head needed.
     """
@@ -106,7 +106,7 @@ class QNetwork(nn.Module):
         return self.forward(z).max(dim=-1).values   # V*(s) = max_a Q(s,a)
 
 
-class NeuralQSheafRL(nn.Module):
+class NeuralQKoopmanRL(nn.Module):
     def __init__(self, d: int = 16):
         super().__init__()
         self.d = d
@@ -115,7 +115,7 @@ class NeuralQSheafRL(nn.Module):
         self.q_net   = QNetwork(d, N_ACTIONS)
 
         # CHANGE 2: Learned Koopman matrices K_a ∈ R^{d×d}, one per action.
-        # Same initialisation as sheaf_rl_neural.py: small random + scaled identity.
+        # Same initialisation as koopman_neural.py: small random + scaled identity.
         self.K = nn.ParameterList([
             nn.Parameter(0.05 * torch.randn(d, d) + 0.2 * torch.eye(d))
             for _ in range(N_ACTIONS)
@@ -141,7 +141,7 @@ class NeuralQSheafRL(nn.Module):
         return [K.cpu().numpy() for K in self.K]
 
 # ---------------------------------------------------------------------------
-# Directed Q-solver — UNCHANGED from sheaf_rl_qstalk.py (pure numpy).
+# Directed Q-solver — UNCHANGED from koopman_rl_qstalk.py (pure numpy).
 # Does NOT use f_θ or K_a; the neural network enters only through a_star.
 # ---------------------------------------------------------------------------
 
@@ -188,7 +188,7 @@ def train(
     solve_every:  int   = 20,    # re-solve directed Q-system every N epochs
 ) -> tuple:
     transitions  = all_transitions()
-    model        = NeuralQSheafRL(d=d)
+    model        = NeuralQKoopmanRL(d=d)
     optimizer    = optim.Adam(model.parameters(), lr=lr)
 
     # Precompute index tensors for the 36 transitions
@@ -251,20 +251,20 @@ def train(
 # Action selection — two routes, both via the neural network
 # ---------------------------------------------------------------------------
 
-def select_action_qnet(s: int, model: NeuralQSheafRL) -> int:
+def select_action_qnet(s: int, model: NeuralQKoopmanRL) -> int:
     """Direct Q-lookup: a* = argmax_a Q_ψ(f_θ(s))[a]."""
     with torch.no_grad():
         z = model.encoder(X_ALL[s])
         return model.q_net(z).argmax().item()
 
 
-def select_action_koopman(s: int, model: NeuralQSheafRL) -> int:
+def select_action_koopman(s: int, model: NeuralQKoopmanRL) -> int:
     """
     Koopman lookahead: a* = argmax_a V*(K_a f_θ(s))
                           = argmax_a max_{a'} Q_ψ(K_a z_s)[a']
 
     Predicts the next latent with K_a, evaluates it with Q_ψ.
-    This is the same lookahead from sheaf_rl_neural.py, now using
+    This is the same lookahead from koopman_rl_neural.py, now using
     V*(z) = max_a Q_ψ(z) instead of a separate value head.
     """
     with torch.no_grad():
@@ -286,7 +286,7 @@ def main():
     np.random.seed(42)
 
     print("=" * 62)
-    print("  Neural Q-Stalk Sheaf-RL  —  3×3 Grid World")
+    print("  Neural Q-Stalk Koopman-RL  —  3×3 Grid World")
     print("  Changes from tabular Q-stalk: encoder f_θ + QNetwork Q_ψ + learned K_a")
     print("  Q-evaluation:  directed sparse solve M q = r (unchanged)")
     print("=" * 62)
@@ -382,8 +382,8 @@ def main():
                       "(learned f_θ + Q_ψ + K_a, exact Bellman Q*)")
 
     plt.tight_layout()
-    plt.savefig("sheaf_rl_qstalk_neural_values.png", dpi=150)
-    print("\nSaved → sheaf_rl_qstalk_neural_values.png")
+    plt.savefig("koopman_qstalk_neural_values.png", dpi=150)
+    print("\nSaved → koopman_qstalk_neural_values.png")
     plt.close()
 
 

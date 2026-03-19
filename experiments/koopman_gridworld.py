@@ -1,5 +1,5 @@
 """
-Latent Affine Sheaf-RL: Minimal 3x3 Grid World Demo
+Latent Affine Koopman-RL: Minimal 3x3 Grid World Demo
 =====================================================
 No neural networks. Pure tabular math with numpy/scipy.
 
@@ -202,7 +202,7 @@ def richardson_diffusion(
 ) -> tuple[np.ndarray, int]:
     """
     X^(k+1) = (I - α Δ_F) X^(k) + α R
-    Δ_F = B^T B  (Sheaf Laplacian)
+    Δ_F = B^T B  (graph Laplacian)
 
     α is set to 1/λ_max for guaranteed convergence (optimal Richardson step).
     Hard Dirichlet anchors applied after every step.
@@ -262,7 +262,7 @@ def select_action(s: int, koopman_ops: list[np.ndarray], V: np.ndarray) -> int:
 # 10. Visualization
 # ---------------------------------------------------------------------------
 
-def visualize(V: np.ndarray, policy: list[int], save_path: str = "sheaf_rl_values.png"):
+def visualize(V: np.ndarray, policy: list[int], save_path: str = "koopman_rl_values.png"):
     fig, ax = plt.subplots(figsize=(6, 5))
     grid = V.reshape(3, 3)
     im = ax.imshow(grid, cmap="YlOrRd", vmin=0, vmax=1, interpolation="nearest")
@@ -281,7 +281,7 @@ def visualize(V: np.ndarray, policy: list[int], save_path: str = "sheaf_rl_value
     ax.set_yticks([0, 1, 2])
     ax.set_xticklabels(["col 0", "col 1", "col 2"])
     ax.set_yticklabels(["row 0", "row 1", "row 2"])
-    ax.set_title("Sheaf-RL: Diffused Values + Koopman Lookahead Policy\n"
+    ax.set_title("Koopman-RL: Diffused Values + Koopman Lookahead Policy\n"
                  "(3×3 Grid, goal=s8 bottom-right)", fontsize=11)
 
     legend = [mpatches.Patch(color="lightyellow", label="Low value (far from goal)"),
@@ -301,7 +301,7 @@ def main():
     np.random.seed(42)
 
     print("=" * 60)
-    print("  Latent Affine Sheaf-RL — 3×3 Grid World Demo")
+    print("  Latent Affine Koopman-RL — 3×3 Grid World Demo")
     print("=" * 60)
 
     # --- Build Koopman operators ---
@@ -341,7 +341,7 @@ def main():
     print("    " + "-" * 27)
 
     # Sanity checks
-    # NOTE: The Sheaf Laplacian minimises disagreement over ALL edges (all 4 actions).
+    # NOTE: The graph Laplacian minimises disagreement over ALL edges (all 4 actions).
     # This is equivalent to evaluating a *uniform random policy*, not the optimal policy.
     # V(s) = γ * E_{a~uniform}[V(s')] rather than γ * max_a V(s').
     # Values are therefore lower than γ^k, but monotonically ordered and sufficient

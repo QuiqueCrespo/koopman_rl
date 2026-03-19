@@ -11,7 +11,7 @@ By adding hard=True, your continuous Koopman rollout is suddenly forced to evalu
 Your current codebase is entangled with the legacy Sheaf/Diffusion logic. We need a pristine, streamlined repository.
 
 1. **Rip Out the Graph:** Delete the replay buffer chunking, the bisimulation metric, and the `directed_value_iteration` logic (keep the code but disable it).
-2. **Rename the Agent:** Rename `SheafAgent` to `KoopmanGradientPlanner` (KGP) or similar.
+2. **Rename the Agent:** Rename `KoopmanAgent` to `KoopmanGradientPlanner` (KGP) or similar.
 3. **Implement the Autoencoder:** Add the linear decoder and the state reconstruction loss ($\mathcal{L}_{recon} = ||\text{decoder}(z) - s||^2$). This permanently fixes your latent collapse issue.
 4. **Finalize the Planners:** Write two clean, separate methods for action selection:
 * `act_plan_continuous()`: Using the `tanh` squash.

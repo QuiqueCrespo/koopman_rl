@@ -1,5 +1,5 @@
 """
-Loss functions for the gravity basin Sheaf-RL agent.
+Loss functions for the gravity basin Koopman-RL agent.
 """
 
 import torch

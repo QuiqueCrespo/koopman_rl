@@ -28,12 +28,12 @@ import torch.optim as optim
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from sheaf_rl.config import Config, ModelConfig, AlgoConfig, TrainConfig
-from sheaf_rl.model import KoopmanGradientPlanner, TargetNetwork
-from sheaf_rl.env import GravityBasin
-from sheaf_rl.buffer import ReplayBuffer
-from sheaf_rl.algorithms import _resolve_device, evaluate
-from sheaf_rl.viz import plot_live
+from koopman_rl.config import Config, ModelConfig, AlgoConfig, TrainConfig
+from koopman_rl.model import KoopmanGradientPlanner, TargetNetwork
+from koopman_rl.env import GravityBasin
+from koopman_rl.buffer import ReplayBuffer
+from koopman_rl.algorithms import _resolve_device, evaluate
+from koopman_rl.viz import plot_live
 
 
 # ---------------------------------------------------------------------------

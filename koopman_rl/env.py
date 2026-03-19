@@ -8,7 +8,7 @@ be configured via make_env(cfg) while GravityBasin() with no args matches legacy
 
 import numpy as np
 
-from sheaf_rl.config import EnvConfig
+from koopman_rl.config import EnvConfig
 
 # Module-level constants (backward compat — match EnvConfig defaults)
 N_ACTIONS    = 4

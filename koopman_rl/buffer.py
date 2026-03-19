@@ -3,12 +3,12 @@ Replay buffer for the gravity basin experiments.
 
 Two sampling modes serve two distinct architectural needs:
   sample_transitions — flat random batches for stable NN gradient updates
-  sample_chunks      — contiguous trajectories for Sheaf graph temporal topology
+  sample_chunks      — contiguous trajectories for Koopman graph temporal topology
 """
 
 import numpy as np
 
-from sheaf_rl.config import Config, BufferConfig, EnvConfig
+from koopman_rl.config import Config, BufferConfig, EnvConfig
 
 # Module-level defaults (backward compat)
 BUFFER_SIZE = 100_000
@@ -22,7 +22,7 @@ class ReplayBuffer:
 
     sample_transitions() draws independent random transitions for TD learning.
     sample_chunks() draws contiguous windows that preserve temporal ordering,
-    which is required for the Sheaf graph builder so that consecutive nodes
+    which is required for the Koopman graph builder so that consecutive nodes
     share src/dst states and form unbroken causal pipes for Richardson diffusion.
     """
 

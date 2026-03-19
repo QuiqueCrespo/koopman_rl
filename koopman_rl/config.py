@@ -1,5 +1,5 @@
 """
-Centralised hyperparameter config for sheaf_rl.
+Centralised hyperparameter config for koopman_rl.
 
 All scattered module-level constants are consolidated here as typed dataclasses.
 Serialisable to/from dict and JSON with no extra dependencies.

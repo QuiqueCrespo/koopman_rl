@@ -2,7 +2,7 @@
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from sheaf_rl.config import Config, TrainConfig, ModelConfig, AlgoConfig
+from koopman_rl.config import Config, TrainConfig, ModelConfig, AlgoConfig
 
 cfg = Config(
     run_name="ortho_raw",

@@ -21,10 +21,10 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import numpy as np
 import torch
 
-from sheaf_rl.config import Config
-from sheaf_rl.algorithms import train, evaluate
+from koopman_rl.config import Config
+from koopman_rl.algorithms import train, evaluate
 
-parser = argparse.ArgumentParser(description="Sheaf-RL ablation runner")
+parser = argparse.ArgumentParser(description="Koopman-RL ablation runner")
 parser.add_argument("--run-name",      required=True,        help="Identifier for this run")
 parser.add_argument("--seed",          type=int, default=42)
 parser.add_argument("--results-dir",   default="results/ablation", help="Output directory")
@@ -119,8 +119,8 @@ print(f"  succ_final={summary['succ_final']}/20  "
       f"greedy={sr*100:.1f}%")
 
 if args.eval_planner:
-    from sheaf_rl.algorithms import evaluate_planner
-    from sheaf_rl.viz import plot_planner_comparison
+    from koopman_rl.algorithms import evaluate_planner
+    from koopman_rl.viz import plot_planner_comparison
 
     model_path = f"{args.results_dir}/{args.run_name}_model.pt"
     torch.save(agent.state_dict(), model_path)

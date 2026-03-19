@@ -1,12 +1,12 @@
 """
-Latent Affine Sheaf-RL: Advantage Stalk (Q-Stalk)
+Latent Affine Koopman-RL: Advantage Stalk (Q-Stalk)
 ==================================================
-Structural fix for the value-averaging problem found in sheaf_rl_gridworld.py.
+Structural fix for the value-averaging problem found in koopman_gridworld.py.
 
 PROBLEM (V-stalk):
   Stalk = [z, v]  (d+1 dimensional)
   Every action edge from s_i contributes to the SAME scalar v_i.
-  The Sheaf Laplacian AVERAGES over all of them:
+  The graph Laplacian AVERAGES over all of them:
     v_i = γ * (1/|A|) * Σ_a V(s_j^a)
   This is the random-policy value, not the optimal value.
   Result: V[s0] ≈ 0.082 instead of the true γ^3 = 0.729.
@@ -190,7 +190,7 @@ def qeval_symmetric(
     tol: float = 1e-8,
 ) -> np.ndarray:
     """
-    Q-evaluation via Richardson iteration on the SYMMETRIC Sheaf Laplacian Δ_F = B^T B.
+    Q-evaluation via Richardson iteration on the SYMMETRIC graph Laplacian Δ_F = B^T B.
 
     WHY THIS GIVES APPROXIMATE (NOT EXACT) VALUES:
     Δ_F = B^T B is symmetric. At each Q(s_i, a) entry, the Laplacian sums:
@@ -299,7 +299,7 @@ def main():
     np.random.seed(42)
 
     print("=" * 62)
-    print("  Sheaf-RL: Advantage Stalk (Q-Stalk)")
+    print("  Koopman-RL: Advantage Stalk (Q-Stalk)")
     print("  Stalk: [z, q_0, q_1, q_2, q_3]  (d + |A| = 13 dim)")
     print("  Fix: each edge updates one Q(s,a), no cross-action averaging")
     print("=" * 62)
@@ -387,8 +387,8 @@ def main():
                       "(Q-values in stalk → no averaging; directed solver → exact γ^k)")
 
     plt.tight_layout()
-    plt.savefig("sheaf_rl_qstalk_values.png", dpi=150)
-    print("\nSaved → sheaf_rl_qstalk_values.png")
+    plt.savefig("koopman_qstalk_values.png", dpi=150)
+    print("\nSaved → koopman_qstalk_values.png")
     plt.close()
 
 

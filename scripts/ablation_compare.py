@@ -15,7 +15,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import numpy as np
-from sheaf_rl.viz import plot_ablation_comparison
+from koopman_rl.viz import plot_ablation_comparison
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--results-dir", default="results/ablation",

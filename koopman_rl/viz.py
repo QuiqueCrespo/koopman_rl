@@ -1,12 +1,12 @@
 """
-Visualisation utilities — consolidated from plot.py and sheaf_rl_directed.py.
+Visualisation utilities — consolidated from plot.py and koopman_rl_directed.py.
 
 Public API:
   goal_patch(cfg)                       → matplotlib Patch
   value_grid(agent, cfg, res=80)        → (XX, YY, V)
   visualize_graph(graph_data, step, cfg) → saves sheaf_graph_live.png
-  plot_live(step, agent, losses, returns, cfg) → saves sheaf_rl_live.png
-  plot_results(history, cfg)            → saves sheaf_rl_directed_results.png
+  plot_live(step, agent, losses, returns, cfg) → saves koopman_rl_live.png
+  plot_results(history, cfg)            → saves koopman_rl_directed_results.png
   plot_planner_comparison(results)      → saves planner_comparison.png
 """
 
@@ -18,11 +18,11 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 
-from sheaf_rl.env import (
+from koopman_rl.env import (
     GravityBasin, GOAL_X, GOAL_Y, MAX_EP_STEPS, N_ACTIONS,
     ACTION_NAMES, ACTION_COLORS, DELTA,
 )
-from sheaf_rl.config import Config
+from koopman_rl.config import Config
 
 
 # ---------------------------------------------------------------------------
@@ -204,7 +204,7 @@ def plot_live(
     agent.to(cpu)
 
     fig, axes = plt.subplots(2, 2, figsize=(14, 11))
-    fig.suptitle(f"Sheaf-RL v2 (Directed VI)  —  step {step:,}", fontsize=13)
+    fig.suptitle(f"Koopman-RL v2 (Directed VI)  —  step {step:,}", fontsize=13)
 
     ax = axes[0, 0]
     if koop_losses:
@@ -445,7 +445,7 @@ def plot_ablation_comparison(results: list, out: str = "ablation_comparison.png"
     results = sorted(results, key=lambda r: (r["run_name"] != "BASE", r["run_name"]))
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(18, max(6, len(results) * 0.45 + 2)))
-    fig.suptitle("Ablation Study — Sheaf-RL Directed VI", fontsize=14, fontweight="bold")
+    fig.suptitle("Ablation Study — Koopman-RL Directed VI", fontsize=14, fontweight="bold")
 
     names      = [r["run_name"] for r in results]
     succ_final = [r["succ_final"] for r in results]

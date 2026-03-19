@@ -1,5 +1,5 @@
 """
-MiniGrid Benchmark: Neural Q-Stalk Sheaf-RL vs DQN
+MiniGrid Benchmark: Neural Q-Stalk Koopman-RL vs DQN
 ====================================================
 Tests both agents on classic MiniGrid environments.
 
@@ -9,7 +9,7 @@ Architecture (shared):
   QNetwork     d → 128 → ReLU → n_actions (7)
   Koopman      K_a ∈ R^{d×d}, one per action  [Sheaf only]
 
-Sheaf-RL     T-step backward recursion + Koopman consistency loss
+Koopman-RL     T-step backward recursion + Koopman consistency loss
 DQN          Single-step Bellman target, same network (no K_a)
 
 Environments (tested in order of complexity):
@@ -182,7 +182,7 @@ class QNetwork(nn.Module):
 # Agents
 # ---------------------------------------------------------------------------
 
-class SheafAgent(nn.Module):
+class KoopmanAgent(nn.Module):
     def __init__(self, d: int):
         super().__init__()
         self.d       = d
@@ -372,10 +372,10 @@ def compute_bisimulation_loss(
 
 
 # ---------------------------------------------------------------------------
-# Sheaf-RL training
+# Koopman-RL training
 # ---------------------------------------------------------------------------
 
-def train_sheaf(cfg: dict, label: str, results_dir: pathlib.Path = None) -> dict:
+def train_koopman(cfg: dict, label: str, results_dir: pathlib.Path = None) -> dict:
     T          = cfg["T"]
     B          = cfg["B"]
     d          = cfg["d"]
@@ -388,7 +388,7 @@ def train_sheaf(cfg: dict, label: str, results_dir: pathlib.Path = None) -> dict
 
     env    = ImgObsWrapper(gym.make(cfg["env_id"], max_steps=max_steps))
     buf    = ReplayBuffer()
-    agent  = SheafAgent(d).to(DEVICE)
+    agent  = KoopmanAgent(d).to(DEVICE)
     target = TargetNet(agent)
     # K_a gets weight_decay as a soft spectral penalty; encoder+Q-net do not.
     opt = optim.Adam([
@@ -412,7 +412,7 @@ def train_sheaf(cfg: dict, label: str, results_dir: pathlib.Path = None) -> dict
     recent_koop, recent_q, recent_bisim = [], [], []
     t0 = time.time()
 
-    print(f"\n  [Sheaf-RL] {label}  d={d}  T={T}  B={B}  "
+    print(f"\n  [Koopman-RL] {label}  d={d}  T={T}  B={B}  "
           f"train_freq={train_freq}  n_steps={n_steps:,}  device={DEVICE}")
 
     for step in range(1, n_steps + 1):
@@ -708,7 +708,7 @@ def plot_all(results: dict, env_names: list) -> None:
     fig, axes = plt.subplots(2, n, figsize=(6 * n, 10))
     if n == 1:
         axes = axes[:, None]
-    fig.suptitle("Sheaf-RL vs DQN — MiniGrid Benchmark\n"
+    fig.suptitle("Koopman-RL vs DQN — MiniGrid Benchmark\n"
                  "Same CNN encoder, optimizer, ε-schedule, step budget",
                  fontsize=13)
 
@@ -719,7 +719,7 @@ def plot_all(results: dict, env_names: list) -> None:
 
         ax = axes[0, col]
         for hist, lbl, color in [
-            (sh, f"Sheaf-RL (T={cfg['T']})", "royalblue"),
+            (sh, f"Koopman-RL (T={cfg['T']})", "royalblue"),
             (dq, "DQN (1-step)",              "tomato"),
         ]:
             ax.plot(_rolling(hist["episode_returns"], 50),
@@ -731,7 +731,7 @@ def plot_all(results: dict, env_names: list) -> None:
 
         ax = axes[1, col]
         for hist, lbl, color in [
-            (sh, "Sheaf-RL", "royalblue"),
+            (sh, "Koopman-RL", "royalblue"),
             (dq, "DQN",      "tomato"),
         ]:
             xs, ys = _success_curve(hist["episode_returns"], 50)
@@ -752,7 +752,7 @@ def print_summary(results: dict, env_names: list) -> None:
     print(hdr)
     print("  " + "-" * (len(hdr) - 2))
     for name in env_names:
-        for key, lbl in [("sheaf", "Sheaf-RL"), ("dqn", "DQN")]:
+        for key, lbl in [("sheaf", "Koopman-RL"), ("dqn", "DQN")]:
             hist = results[name][key]
             ret  = hist["episode_returns"]
             sr   = np.mean([r > 0 for r in ret[-100:]]) * 100 if len(ret) >= 100 else 0.0
@@ -782,7 +782,7 @@ def main():
     print(f"  Results dir: {results_dir}")
 
     print("=" * 62)
-    print("  MiniGrid Benchmark: Sheaf-RL vs DQN")
+    print("  MiniGrid Benchmark: Koopman-RL vs DQN")
     print(f"  Environments: {run_envs}")
     print(f"  Device: {DEVICE}")
     print("=" * 62)
@@ -795,7 +795,7 @@ def main():
         print(f"{'='*62}")
 
         torch.manual_seed(42); np.random.seed(42); random.seed(42)
-        sheaf_hist = train_sheaf(cfg, name, results_dir=results_dir)
+        sheaf_hist = train_koopman(cfg, name, results_dir=results_dir)
 
         torch.manual_seed(42); np.random.seed(42); random.seed(42)
         dqn_hist = train_dqn(cfg, name, results_dir=results_dir)

@@ -1,7 +1,7 @@
 """
-Latent Affine Sheaf-RL: Neural Extension (3x3 Grid World)
+Latent Affine Koopman-RL: Neural Extension (3x3 Grid World)
 ==========================================================
-Two changes from sheaf_rl_gridworld.py:
+Two changes from koopman_rl_gridworld.py:
   1. Encoder f_θ  — one_hot(s) → z ∈ R^d  (replaces fixed one-hot identity)
   2. Koopman K_a  — learned d×d matrices   (replaces hard-coded permutations)
 
@@ -82,7 +82,7 @@ class ValueNetwork(nn.Module):
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         return self.net(z).squeeze(-1)
 
-class NeuralSheafRL(nn.Module):
+class NeuralKoopmanRL(nn.Module):
     def __init__(self, d: int = 16):
         super().__init__()
         self.d = d
@@ -152,7 +152,7 @@ def build_incidence_matrix(
 # ---------------------------------------------------------------------------
 
 def diffuse_values(
-    model: NeuralSheafRL,
+    model: NeuralKoopmanRL,
     transitions: list[tuple],
     K_steps: int = 300,
     tol: float = 1e-7,
@@ -209,7 +209,7 @@ def train(
     diffuse_every: int = 30,
 ) -> tuple:
     transitions = all_transitions()
-    model       = NeuralSheafRL(d=d)
+    model       = NeuralKoopmanRL(d=d)
     optimizer   = optim.Adam(model.parameters(), lr=lr)
 
     states_idx      = torch.tensor([t[0] for t in transitions])
@@ -268,7 +268,7 @@ def train(
 # Action selection — structurally IDENTICAL to tabular version.
 # ---------------------------------------------------------------------------
 
-def select_action(s: int, model: NeuralSheafRL) -> int:
+def select_action(s: int, model: NeuralKoopmanRL) -> int:
     """a* = argmax_a  V_ψ(K_a · f_θ(s))"""
     with torch.no_grad():
         z = model.encoder(X_ALL[s])   # [d]
@@ -289,7 +289,7 @@ def main():
     np.random.seed(42)
 
     print("=" * 62)
-    print("  Neural Sheaf-RL  —  3×3 Grid World")
+    print("  Neural Koopman-RL  —  3×3 Grid World")
     print("  Changes from tabular: encoder f_θ + learned K_a")
     print("  Unchanged: incidence matrix, Richardson solver, anchors")
     print("=" * 62)
@@ -336,7 +336,7 @@ def main():
     ax1.plot(v_losses, label="Value loss  $\\|V_\\psi - V_{\\mathrm{diff}}\\|^2$", alpha=0.8)
     ax1.set_xlabel("Epoch")
     ax1.set_ylabel("Loss")
-    ax1.set_title("Neural Sheaf-RL: Training Losses")
+    ax1.set_title("Neural Koopman-RL: Training Losses")
     ax1.legend()
     ax1.set_yscale("log")
     ax1.grid(True, alpha=0.3)
@@ -354,8 +354,8 @@ def main():
                   "(learned encoder + learned $K_a$)")
 
     plt.tight_layout()
-    plt.savefig("sheaf_rl_neural_values.png", dpi=150)
-    print("\nSaved → sheaf_rl_neural_values.png")
+    plt.savefig("koopman_neural_values.png", dpi=150)
+    print("\nSaved → koopman_neural_values.png")
     plt.close()
 
 

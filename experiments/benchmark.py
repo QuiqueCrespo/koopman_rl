@@ -1,5 +1,5 @@
 """
-DQN vs Neural Q-Stalk Sheaf-RL: 2D Gravity Basin Benchmark
+DQN vs Neural Q-Stalk Koopman-RL: 2D Gravity Basin Benchmark
 ===========================================================
 Both agents share everything except the TD target and the Koopman loss.
 
@@ -10,11 +10,11 @@ Identical across both:
   Target net    EMA, τ=0.005
   ε-schedule    1.0 → 0.05 over 40k steps, warmup=3000
   Budget        100k environment steps
-  Batch size    256 transitions per gradient step (= B×T = 16×16 from Sheaf)
+  Batch size    256 transitions per gradient step (= B×T = 16×16 from Koopman-RL)
 
 Differs:
-  DQN    target = r + γ·max_{a'} Q_tgt(s',a')           (single-step Bellman)
-  Sheaf  target = T=16 backward recursion + Koopman loss (multi-step diffusion)
+  DQN         target = r + γ·max_{a'} Q_tgt(s',a')           (single-step Bellman)
+  Koopman-RL  target = T=16 backward recursion + Koopman loss (multi-step diffusion)
 """
 
 import numpy as np
@@ -27,9 +27,9 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-# Reuse environment and network components from the Sheaf-RL implementation
+# Reuse environment and network components from the Koopman-RL implementation
 from gravity_basin import (
-    GravityBasin, Encoder, QNetwork, train as train_sheaf, evaluate,
+    GravityBasin, Encoder, QNetwork, train as train_koopman, evaluate,
     N_ACTIONS, STATE_DIM, D, GAMMA, EMA_TAU, LR,
     WARMUP, N_STEPS, EPS_START, EPS_END, EPS_DECAY, LOG_EVERY, MAX_EP_STEPS,
     BUFFER_SIZE, B, T_CHUNK,
@@ -80,7 +80,7 @@ class DQNBuffer:
 # ---------------------------------------------------------------------------
 
 class DQNAgent(nn.Module):
-    """Same capacity as SheafAgent minus the K_a ParameterList."""
+    """Same capacity as KoopmanAgent minus the K_a ParameterList."""
     def __init__(self):
         super().__init__()
         self.encoder = Encoder(STATE_DIM, D)
@@ -209,7 +209,7 @@ def _success_curve(returns, window=50):
 
 def plot_comparison(sheaf_hist: dict, dqn_hist: dict) -> None:
     fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-    fig.suptitle("Sheaf-RL vs DQN — 2D Gravity Basin\n"
+    fig.suptitle("Koopman-RL vs DQN — 2D Gravity Basin\n"
                  f"Identical network, optimizer, ε-schedule, budget ({N_STEPS:,} steps)",
                  fontsize=13)
 
@@ -217,7 +217,7 @@ def plot_comparison(sheaf_hist: dict, dqn_hist: dict) -> None:
     ax = axes[0]
     w = 50
     for hist, label, color in [
-        (sheaf_hist, f"Sheaf-RL  (T={T_CHUNK} multi-step + Koopman)", "royalblue"),
+        (sheaf_hist, f"Koopman-RL  (T={T_CHUNK} multi-step + Koopman)", "royalblue"),
         (dqn_hist,   "DQN  (single-step Bellman)",                     "tomato"),
     ]:
         r = hist["episode_returns"]
@@ -233,7 +233,7 @@ def plot_comparison(sheaf_hist: dict, dqn_hist: dict) -> None:
     # 2. Rolling success rate
     ax = axes[1]
     for hist, label, color in [
-        (sheaf_hist, "Sheaf-RL", "royalblue"),
+        (sheaf_hist, "Koopman-RL", "royalblue"),
         (dqn_hist,   "DQN",      "tomato"),
     ]:
         xs, ys = _success_curve(hist["episode_returns"], window=50)
@@ -251,7 +251,7 @@ def plot_comparison(sheaf_hist: dict, dqn_hist: dict) -> None:
     steps_sheaf = np.arange(1, len(sheaf_hist["q_losses"]) + 1) * LOG_EVERY
     steps_dqn   = np.arange(1, len(dqn_hist["q_losses"])   + 1) * LOG_EVERY
     ax.semilogy(steps_sheaf, sheaf_hist["q_losses"],
-                color="royalblue", linewidth=1.5, label="Sheaf-RL  $\\mathcal{L}_Q$")
+                color="royalblue", linewidth=1.5, label="Koopman-RL  $\\mathcal{L}_Q$")
     ax.semilogy(steps_dqn,   dqn_hist["q_losses"],
                 color="tomato",    linewidth=1.5, label="DQN  $\\mathcal{L}_Q$")
     ax.set_xlabel("Environment step")
@@ -272,13 +272,13 @@ def plot_comparison(sheaf_hist: dict, dqn_hist: dict) -> None:
 
 def main():
     print("\n" + "=" * 62)
-    print("  BENCHMARK: Sheaf-RL vs DQN — 2D Gravity Basin")
+    print("  BENCHMARK: Koopman-RL vs DQN — 2D Gravity Basin")
     print("=" * 62 + "\n")
 
-    # --- Sheaf-RL ---
-    print("\n>>> Running Sheaf-RL ...\n")
+    # --- Koopman-RL ---
+    print("\n>>> Running Koopman-RL ...\n")
     torch.manual_seed(42); np.random.seed(42); random.seed(42)
-    sheaf_hist = train_sheaf()
+    sheaf_hist = train_koopman()
 
     sheaf_agent = sheaf_hist["agent"]
     sr_s, ms_s  = evaluate(sheaf_agent, n_episodes=200)
@@ -293,7 +293,7 @@ def main():
 
     # --- Summary table ---
     print("\n" + "=" * 62)
-    print(f"  {'Metric':<35} {'Sheaf-RL':>10}  {'DQN':>10}")
+    print(f"  {'Metric':<35} {'Koopman-RL':>10}  {'DQN':>10}")
     print("  " + "-" * 58)
 
     def first_ep_above(returns, threshold=0.8, window=10):

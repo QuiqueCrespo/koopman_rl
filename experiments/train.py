@@ -1,5 +1,5 @@
 """
-Training loop and evaluation for gravity basin Sheaf-RL.
+Training loop and evaluation for gravity basin Koopman-RL.
 """
 
 import numpy as np
@@ -9,7 +9,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 
 from env    import GravityBasin, N_ACTIONS, STATE_DIM, MAX_EP_STEPS
-from model  import SheafAgent, TargetNetwork, D, LR
+from model  import KoopmanAgent, TargetNetwork, D, LR
 from buffer import ReplayBuffer, B, T_CHUNK
 from losses import (compute_v_targets, compute_bisimulation_loss,
                     compute_contrastive_loss, compute_isometric_loss,
@@ -26,14 +26,14 @@ LOG_EVERY = 2_000
 
 def train(hook=None, n_steps_override: int = None) -> dict:
     """
-    Online Sheaf-RL training loop.
+    Online Koopman-RL training loop.
 
     Returns history dict:
       agent, koop_losses, q_losses (alias for v_losses), episode_returns, episode_steps
     """
     env    = GravityBasin()
     buf    = ReplayBuffer()
-    agent  = SheafAgent()
+    agent  = KoopmanAgent()
     target = TargetNetwork(agent)
     opt    = optim.Adam(agent.parameters(), lr=LR)
 
@@ -45,7 +45,7 @@ def train(hook=None, n_steps_override: int = None) -> dict:
     recent_koop, recent_v = [], []
 
     print("=" * 62)
-    print("  Neural Q-Stalk Sheaf-RL — 2D Gravity Basin")
+    print("  Neural Q-Stalk Koopman-RL — 2D Gravity Basin")
     print(f"  State: (x,y)∈[-1,1]²   d={D}   B={B}×T={T_CHUNK}")
     print(f"  M matrix: {B} block-diagonal upper-bidiagonal chains")
     print(f"  Solve: backward recursion  O({B}·{T_CHUNK}) per step")
@@ -187,7 +187,7 @@ def train(hook=None, n_steps_override: int = None) -> dict:
     }
 
 
-def evaluate(agent: SheafAgent, n_episodes: int = 100) -> tuple[float, float]:
+def evaluate(agent: KoopmanAgent, n_episodes: int = 100) -> tuple[float, float]:
     """Greedy policy rollout. Returns (success_rate, mean_steps_on_success)."""
     env = GravityBasin()
     successes, steps_list = 0, []

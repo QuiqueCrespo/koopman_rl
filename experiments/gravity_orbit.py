@@ -1,5 +1,5 @@
 """
-Gravity Orbit — re-export shim for sheaf_rl_global.py.
+Gravity Orbit — re-export shim for koopman_global.py.
 
 Drop-in replacement for gravity_basin.py that swaps in GravityOrbit
 and provides orbit-specific plot helpers and evaluate function.
@@ -11,7 +11,7 @@ from env_orbit import (
     GravityOrbit,
     TARGET_RADIUS, SIGMA_R, ORBIT_MAX_EP_STEPS,
 )
-# expose MAX_EP_STEPS under the standard name so sheaf_rl_global.py
+# expose MAX_EP_STEPS under the standard name so koopman_global.py
 # doesn't need a special case
 MAX_EP_STEPS = ORBIT_MAX_EP_STEPS
 
@@ -19,7 +19,7 @@ MAX_EP_STEPS = ORBIT_MAX_EP_STEPS
 from env import N_ACTIONS, STATE_DIM, DELTA, ACTION_NAMES, ACTION_COLORS
 
 # ---- model, buffer, losses — unchanged ----------------------------------
-from model import Encoder, ValueNetwork, QNetwork, SheafAgent, TargetNetwork, D, LR, EMA_TAU
+from model import Encoder, ValueNetwork, QNetwork, KoopmanAgent, TargetNetwork, D, LR, EMA_TAU
 from buffer import ReplayBuffer, BUFFER_SIZE, B, T_CHUNK
 from losses import (
     compute_contrastive_loss, compute_isometric_loss,

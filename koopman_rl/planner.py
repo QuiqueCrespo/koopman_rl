@@ -17,7 +17,7 @@ import torch
 import torch.nn.functional as F
 import torch.optim as optim
 
-from sheaf_rl.config import Config
+from koopman_rl.config import Config
 
 
 def plan_action_shooting(
