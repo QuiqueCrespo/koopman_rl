@@ -910,17 +910,14 @@ def run_continuous_toeplitz(device: torch.device, n_steps: int = N_STEPS,
                                         (N_ENVS, ACTION_DIM)).astype(np.float32)
         else:
             if sequential:
-                acts = [agent.act_plan_continuous(
-                            states[i], horizon=PLAN_HORIZON, plan_iters=PLAN_ITERS,
-                            action_scale=ACTION_SCALE, frozen_b=frozen_b)
-                        for i in range(N_ENVS)]
+                actions = agent.act_plan_continuous_batch(
+                    states, horizon=PLAN_HORIZON, plan_iters=PLAN_ITERS,
+                    action_scale=ACTION_SCALE, frozen_b=frozen_b)
             else:
-                acts = [agent.act_plan_toeplitz_continuous(
-                            states[i], horizon=PLAN_HORIZON, plan_iters=PLAN_ITERS,
-                            gamma=GAMMA, action_scale=ACTION_SCALE,
-                            cumulative=cumulative)
-                        for i in range(N_ENVS)]
-            actions = np.stack(acts)  # [N_ENVS, ACTION_DIM]
+                actions = agent.act_plan_toeplitz_continuous_batch(
+                    states, horizon=PLAN_HORIZON, plan_iters=PLAN_ITERS,
+                    gamma=GAMMA, action_scale=ACTION_SCALE,
+                    cumulative=cumulative)
             if ou_noise:
                 exploration = np.stack([ou_list[i].sample(sigma=noise * ACTION_SCALE)
                                         for i in range(N_ENVS)])

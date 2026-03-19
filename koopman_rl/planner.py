@@ -576,6 +576,137 @@ def plan_action_toeplitz_continuous(
         return (torch.tanh(u_logits[0]) * action_scale).to(torch.float32).cpu().numpy()
 
 
+def plan_action_toeplitz_continuous_batch(
+    agent,
+    states:       np.ndarray,    # [N, state_dim]
+    horizon:      int   = 10,
+    plan_iters:   int   = 20,
+    lr:           float = 0.1,
+    gamma:        float = 0.95,
+    action_scale: float = 1.0,
+    cumulative:   bool  = True,
+) -> np.ndarray:
+    """
+    Batched Block-Toeplitz GEMM planner: plans for N states simultaneously.
+
+    W_toeplitz and gammas only depend on A (not the state) — built once and
+    shared across all N states.  ZIR is batched via a single einsum.  The
+    Adam optimiser runs over u_logits [N, H, action_dim] so each gradient
+    step is one batched GEMM instead of N sequential calls.
+
+    Returns actions [N, action_dim] ∈ [-action_scale, action_scale].
+    Requires ortho_a=True (linear superposition Z = ZIR + W X must hold).
+    """
+    device     = next(agent.parameters()).device
+    d          = agent.d
+    action_dim = agent.B.shape[1]
+    N          = len(states)
+
+    with torch.no_grad():
+        z0 = agent.encoder(
+            torch.tensor(states, dtype=torch.float32, device=device)
+        ).to(torch.float64)                                    # [N, d]
+
+        A = agent.A.detach().to(torch.float64)
+        B = agent.B.detach().to(torch.float64)                 # [d, action_dim]
+
+        # A^0 … A^H — built once, shared across all N states
+        A_pows = [torch.eye(d, device=device, dtype=torch.float64)]
+        for _ in range(horizon):
+            A_pows.append(A_pows[-1] @ A)
+        A_stack = torch.stack(A_pows)                          # [H+1, d, d]
+
+        # ZIR[n, k] = A^{k+1} z0[n] — one batched einsum for all N states
+        ZIR = torch.einsum('kij,nj->nki', A_stack[1:], z0)    # [N, H, d]
+
+        # W_toeplitz — state-independent, built once for all N
+        row_idx    = torch.arange(horizon, device=device).unsqueeze(1)
+        col_idx    = torch.arange(horizon, device=device).unsqueeze(0)
+        power_idx  = (row_idx - col_idx).clamp(min=0)
+        causal     = (row_idx >= col_idx).to(torch.float64)
+        W_blocks   = A_stack[power_idx] * causal.unsqueeze(-1).unsqueeze(-1)
+        W_toeplitz = W_blocks.permute(0, 2, 1, 3).reshape(horizon * d, horizon * d)
+
+        gammas = (gamma ** torch.arange(1, horizon + 1, device=device,
+                                        dtype=torch.float64))  # [H]
+
+    u_logits = torch.randn(N, horizon, action_dim, device=device,
+                           dtype=torch.float64) * 1e-4
+    u_logits.requires_grad_(True)
+    opt = optim.Adam([u_logits], lr=lr)
+
+    for _ in range(plan_iters):
+        opt.zero_grad()
+
+        u      = torch.tanh(u_logits)                          # [N, H, action_dim]
+        X_flat = (u @ B.T).reshape(N, horizon * d)            # [N, H*d]
+
+        # Single batched GEMM for all N states
+        ZSR = (X_flat @ W_toeplitz.T).reshape(N, horizon, d)  # [N, H, d]
+        Z   = ZIR + ZSR                                        # [N, H, d]
+        Z32 = Z.to(torch.float32)
+
+        if cumulative:
+            v_vals = agent.v_net(Z32.reshape(N * horizon, d)).reshape(N, horizon)
+            loss   = -(gammas.unsqueeze(0) * v_vals).sum()
+        else:
+            loss = -agent.v_net(Z32[:, -1, :]).mean()
+
+        (grad_u,) = torch.autograd.grad(loss, u_logits, only_inputs=True)
+        u_logits.grad = grad_u
+        opt.step()
+
+    with torch.no_grad():
+        return (torch.tanh(u_logits[:, 0, :]) * action_scale).to(torch.float32).cpu().numpy()
+
+
+def plan_action_continuous_batch(
+    agent,
+    states:       np.ndarray,    # [N, state_dim]
+    horizon:      int   = 10,
+    plan_iters:   int   = 20,
+    lr:           float = 0.1,
+    action_scale: float = 1.0,
+    frozen_b:     bool  = False,
+) -> np.ndarray:
+    """
+    Batched sequential MPC: plans for N states simultaneously.
+
+    Encodes all N states in one forward pass.  Adam optimises
+    u_logits [N, H, action_dim]; each dyn_step operates on the full [N, d] batch.
+
+    Returns actions [N, action_dim].
+    """
+    device     = next(agent.parameters()).device
+    action_dim = agent.B.shape[1]
+    N          = len(states)
+    B          = agent.B.detach() if frozen_b else agent.B
+
+    with torch.no_grad():
+        z_start = agent.encoder(
+            torch.tensor(states, dtype=torch.float32, device=device)
+        )  # [N, d]
+
+    u_logits = torch.randn(N, horizon, action_dim, device=device) * 1e-4
+    u_logits.requires_grad_(True)
+    opt = optim.Adam([u_logits], lr=lr)
+
+    for _ in range(plan_iters):
+        opt.zero_grad()
+        z_t = z_start
+        u   = torch.tanh(u_logits)          # [N, H, action_dim]
+        for t in range(horizon):
+            z_t = agent.dyn_step(z_t, u[:, t, :] @ B.T)   # [N, d] → [N, d]
+        loss = -agent.v_net(z_t).mean()
+
+        (grad_u,) = torch.autograd.grad(loss, u_logits, only_inputs=True)
+        u_logits.grad = grad_u
+        opt.step()
+
+    with torch.no_grad():
+        return (torch.tanh(u_logits[:, 0, :]) * action_scale).cpu().numpy()
+
+
 def plan_action_continuous(
     agent,
     state:      np.ndarray,

@@ -296,6 +296,26 @@ class KoopmanGradientPlanner(nn.Module):
                                                gamma=gamma, action_scale=action_scale,
                                                cumulative=cumulative)
 
+    def act_plan_toeplitz_continuous_batch(self, states: np.ndarray,
+                                           horizon: int = 10, plan_iters: int = 20,
+                                           gamma: float = 0.95, action_scale: float = 1.0,
+                                           cumulative: bool = True) -> np.ndarray:
+        """Batched Block-Toeplitz GEMM MPC for N states. W_toeplitz built once.
+        Returns [N, action_dim]. Requires ortho_a=True."""
+        from koopman_rl.planner import plan_action_toeplitz_continuous_batch
+        return plan_action_toeplitz_continuous_batch(self, states, horizon, plan_iters,
+                                                     gamma=gamma, action_scale=action_scale,
+                                                     cumulative=cumulative)
+
+    def act_plan_continuous_batch(self, states: np.ndarray,
+                                  horizon: int = 10, plan_iters: int = 20,
+                                  action_scale: float = 1.0,
+                                  frozen_b: bool = False) -> np.ndarray:
+        """Batched sequential MPC for N states. Returns [N, action_dim]."""
+        from koopman_rl.planner import plan_action_continuous_batch
+        return plan_action_continuous_batch(self, states, horizon, plan_iters,
+                                            action_scale=action_scale, frozen_b=frozen_b)
+
 
 # Backward-compatibility alias: KoopmanAgent is an alias for KoopmanGradientPlanner
 KoopmanAgent = KoopmanGradientPlanner
