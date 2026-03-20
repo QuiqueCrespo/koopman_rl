@@ -147,3 +147,33 @@ class ReplayBuffer:
             "rewards": self.rewards[idx_flat],
             "dones":   self.dones[idx_flat],
         }
+
+
+class ContinuousReplayBuffer:
+    def __init__(self, capacity: int, state_dim: int, action_dim: int):
+        self.capacity  = capacity
+        self.states    = np.zeros((capacity, state_dim),  dtype=np.float32)
+        self.next_s    = np.zeros((capacity, state_dim),  dtype=np.float32)
+        self.actions   = np.zeros((capacity, action_dim), dtype=np.float32)
+        self.rewards   = np.zeros(capacity, dtype=np.float32)
+        self.dones     = np.zeros(capacity, dtype=np.float32)  # terminated | truncated
+        self.terminals = np.zeros(capacity, dtype=np.float32)  # terminated only (for TD)
+        self.ptr = self.size = 0
+
+    def push_batch(self, states, actions, rewards, next_states, dones, terminals):
+        """Insert a batch of N transitions using modular index arithmetic."""
+        n   = len(states)
+        idx = np.arange(self.ptr, self.ptr + n) % self.capacity
+        self.states[idx]    = states
+        self.next_s[idx]    = next_states
+        self.actions[idx]   = actions
+        self.rewards[idx]   = rewards
+        self.dones[idx]     = dones.astype(np.float32)
+        self.terminals[idx] = terminals.astype(np.float32)
+        self.ptr  = (self.ptr + n) % self.capacity
+        self.size = min(self.size + n, self.capacity)
+
+    def sample(self, n: int) -> dict:
+        idx = np.random.randint(0, self.size, n)
+        return {k: getattr(self, k)[idx]
+                for k in ("states", "next_s", "actions", "rewards", "dones", "terminals")}

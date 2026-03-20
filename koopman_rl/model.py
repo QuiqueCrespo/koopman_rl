@@ -25,6 +25,12 @@ import torch.nn.functional as F
 import torch.nn.utils.parametrize as parametrize
 
 from koopman_rl.config import Config, ModelConfig, EnvConfig
+from koopman_rl.planner import (
+    _build_w_toeplitz,
+    plan_action_gumbel, plan_action_toeplitz,
+    plan_action_continuous, plan_action_continuous_batch,
+    plan_action_toeplitz_continuous_batch,
+)
 
 # Module-level defaults (backward compat)
 N_ACTIONS = 4
@@ -174,6 +180,23 @@ class KoopmanGradientPlanner(nn.Module):
         nn.init.orthogonal_(B)
         self.B = nn.Parameter(B)
 
+        # Toeplitz cache: keyed by (horizon, gamma) → (W_toeplitz, gammas, A_stack)
+        # Valid until invalidate_toeplitz_cache() is called (after each opt.step()).
+        self._toeplitz_cache: dict = {}
+
+    def get_toeplitz_cache(self, horizon: int, gamma: float) -> tuple:
+        """Return cached (W_toeplitz, gammas, A_stack), building if needed."""
+        key = (horizon, gamma)
+        if key not in self._toeplitz_cache:
+            device = next(self.parameters()).device
+            self._toeplitz_cache[key] = _build_w_toeplitz(
+                self.A.detach(), horizon, gamma, device)
+        return self._toeplitz_cache[key]
+
+    def invalidate_toeplitz_cache(self) -> None:
+        """Call after opt.step() — A may have changed."""
+        self._toeplitz_cache.clear()
+
     def __getattr__(self, name: str):
         # With hard constraint, 'A' is not a bare Parameter — return the O(d) weight.
         if name == 'A' and self.__dict__.get('_use_hard_ortho', False):
@@ -254,7 +277,6 @@ class KoopmanGradientPlanner(nn.Module):
                           horizon: int = 10, plan_iters: int = 20,
                           tau: float = 1.0) -> int:
         """Gumbel-Softmax MPC — discrete environments."""
-        from koopman_rl.planner import plan_action_gumbel
         return plan_action_gumbel(self, state, horizon, plan_iters, tau=tau)
 
     def act_plan_toeplitz(self, state: np.ndarray,
@@ -264,7 +286,6 @@ class KoopmanGradientPlanner(nn.Module):
         """Block-Toeplitz GEMM planner — requires ortho_a=True.
         Pre-computes ZIR and W_toeplitz outside the Adam loop; each iteration
         is a single dense GEMM instead of H sequential dyn_step calls."""
-        from koopman_rl.planner import plan_action_toeplitz
         return plan_action_toeplitz(self, state, horizon, plan_iters,
                                     lr=lr, tau=tau, gamma=gamma)
 
@@ -273,7 +294,6 @@ class KoopmanGradientPlanner(nn.Module):
                             action_scale: float = 1.0,
                             frozen_b: bool = False) -> np.ndarray:
         """tanh-squash MPC — continuous environments. Returns action ∈ [-scale, scale]^d."""
-        from koopman_rl.planner import plan_action_continuous
         return plan_action_continuous(self, state, horizon, plan_iters,
                                       frozen_b=frozen_b) * action_scale
 
@@ -284,10 +304,10 @@ class KoopmanGradientPlanner(nn.Module):
         """Block-Toeplitz GEMM MPC — continuous environments, requires ortho_a=True.
         cumulative=False uses terminal V only (stable for data collection);
         cumulative=True uses discounted sum over horizon (better at eval)."""
-        from koopman_rl.planner import plan_action_toeplitz_continuous
-        return plan_action_toeplitz_continuous(self, state, horizon, plan_iters,
-                                               gamma=gamma, action_scale=action_scale,
-                                               cumulative=cumulative)
+        return plan_action_toeplitz_continuous_batch(
+            self, state[np.newaxis], horizon, plan_iters,
+            gamma=gamma, action_scale=action_scale, cumulative=cumulative,
+        )[0]
 
     def act_plan_toeplitz_continuous_batch(self, states: np.ndarray,
                                            horizon: int = 10, plan_iters: int = 20,
@@ -295,7 +315,6 @@ class KoopmanGradientPlanner(nn.Module):
                                            cumulative: bool = True) -> np.ndarray:
         """Batched Block-Toeplitz GEMM MPC for N states. W_toeplitz built once.
         Returns [N, action_dim]. Requires ortho_a=True."""
-        from koopman_rl.planner import plan_action_toeplitz_continuous_batch
         return plan_action_toeplitz_continuous_batch(self, states, horizon, plan_iters,
                                                      gamma=gamma, action_scale=action_scale,
                                                      cumulative=cumulative)
@@ -305,7 +324,6 @@ class KoopmanGradientPlanner(nn.Module):
                                   action_scale: float = 1.0,
                                   frozen_b: bool = False) -> np.ndarray:
         """Batched sequential MPC for N states. Returns [N, action_dim]."""
-        from koopman_rl.planner import plan_action_continuous_batch
         return plan_action_continuous_batch(self, states, horizon, plan_iters,
                                             action_scale=action_scale, frozen_b=frozen_b)
 

@@ -20,6 +20,10 @@ from koopman_rl.config import Config
 from koopman_rl.env import GravityBasin
 from koopman_rl.model import KoopmanGradientPlanner, TargetNetwork
 from koopman_rl.buffer import ReplayBuffer
+from koopman_rl.planner import (
+    plan_action_gumbel, plan_action_shooting, plan_action_beam,
+    plan_action_toeplitz,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -451,38 +455,26 @@ def evaluate(agent, cfg=None, n_episodes: int = 100) -> tuple:
 
 def evaluate_planner(agent, cfg=None, n_episodes: int = 100,
                      horizon: int = 10, plan_iters: int = 20) -> dict:
-    """Compare all planner variants: greedy, gumbel, softmax, shooting, beam."""
-    from koopman_rl.planner import (
-        plan_action_gumbel, plan_action_gumbel_cumulative,
-        plan_action_softmax, plan_action_softmax_cumulative,
-        plan_action_shooting, plan_action_beam,
-        plan_action_toeplitz,
-    )
-    from koopman_rl.env import GravityBasin
-
+    """Compare planner variants: greedy, gumbel (terminal + cumulative), shooting, beam, toeplitz."""
     env       = GravityBasin(cfg.env if cfg else None)
     max_steps = env.max_ep_steps
 
     results = {
-        "greedy":        [],
-        "gumbel":        [],
-        "gumbel_cumul":  [],
-        "softmax":       [],
-        "softmax_cumul": [],
-        "shooting_200":  [],
-        "beam_8":        [],
-        "toeplitz":      [],
+        "greedy":       [],
+        "gumbel":       [],
+        "gumbel_cumul": [],
+        "shooting_200": [],
+        "beam_8":       [],
+        "toeplitz":     [],
     }
 
     for mode, act_fn in [
-        ("greedy",        lambda s: agent.act(s, epsilon=0.0)),
-        ("gumbel",        lambda s: plan_action_gumbel(agent, s, horizon, plan_iters)),
-        ("gumbel_cumul",  lambda s: plan_action_gumbel_cumulative(agent, s, horizon, plan_iters)),
-        ("softmax",       lambda s: plan_action_softmax(agent, s, horizon, plan_iters)),
-        ("softmax_cumul", lambda s: plan_action_softmax_cumulative(agent, s, horizon, plan_iters)),
-        ("shooting_200",  lambda s: plan_action_shooting(agent, s, horizon, n_samples=200)),
-        ("beam_8",        lambda s: plan_action_beam(agent, s, horizon, beam_width=8)),
-        ("toeplitz",      lambda s: plan_action_toeplitz(agent, s, horizon, plan_iters)),
+        ("greedy",       lambda s: agent.act(s, epsilon=0.0)),
+        ("gumbel",       lambda s: plan_action_gumbel(agent, s, horizon, plan_iters)),
+        ("gumbel_cumul", lambda s: plan_action_gumbel(agent, s, horizon, plan_iters, cumulative=True)),
+        ("shooting_200", lambda s: plan_action_shooting(agent, s, horizon, n_samples=200)),
+        ("beam_8",       lambda s: plan_action_beam(agent, s, horizon, beam_width=8)),
+        ("toeplitz",     lambda s: plan_action_toeplitz(agent, s, horizon, plan_iters)),
     ]:
         print(f"\n  [{mode}] evaluating {n_episodes} episodes...", flush=True)
         for _ in range(n_episodes):

@@ -17,6 +17,8 @@ class EnvConfig:
     goal_y:       float = 0.8
     max_ep_steps: int   = 200
     step_penalty: float = -0.01
+    action_scale: float = 1.0    # multiply tanh output → real action range
+    continuous:   bool  = False  # continuous action space (vs discrete)
 
 
 @dataclass
@@ -56,6 +58,9 @@ class AlgoConfig:
     fix_a:               bool  = False
     no_normalize:        bool  = False
     lambda_ortho:        float = 1.0   # weight of soft ||AᵀA − I||²_F penalty (ortho_a=True only)
+    # Continuous control
+    reward_scale:        float = 1.0   # divide rewards before TD
+    n_envs:              int   = 1     # parallel envs for vectorised collection
 
 
 @dataclass
@@ -77,6 +82,17 @@ class TrainConfig:
     eps_decay:  int   = 40_000
     log_every:  int   = 2_000
     plot_every: int   = 2_000
+    # Continuous control
+    noise_start:  float = 1.0
+    noise_end:    float = 0.05
+    noise_decay:  int   = 40_000
+    viz_every:    int   = 5_000
+    viz_dir:      str   = "output/viz"
+    ckpt_dir:     str   = "output/checkpoints"
+    planner_type: str   = "toeplitz"   # "toeplitz" | "sequential"
+    cumulative:   bool  = False        # cumulative vs terminal value objective
+    frozen_b:     bool  = False        # detach B in sequential planner
+    ou_noise:     bool  = False        # Ornstein-Uhlenbeck vs i.i.d. Gaussian
 
 
 @dataclass
