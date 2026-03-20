@@ -17,8 +17,10 @@ Performance notes:
   - All Toeplitz planners read agent.get_toeplitz_cache() — W_toeplitz and A_stack are
     built once per (horizon, gamma) key and reused until agent.invalidate_toeplitz_cache()
     is called (which the trainer does after every opt.step()).
-  - Continuous planners use manual in-place GD (u_logits.data -= lr * grad) instead of
-    optim.Adam to avoid Python optimizer object overhead inside the hot loop.
+  - Continuous planners use Adam with manual grad assignment (u_logits.grad = grad; opt.step())
+    to get bias-corrected second-moment normalization. Raw GD underperforms Adam for short
+    (10-iter) planning because gradient magnitudes through B and A^k are O(1/√d), making
+    raw GD steps ~10x smaller than Adam's normalized steps at the same lr.
   - Everything stays float32: A ∈ O(d) has condition number 1, so A^H is numerically
     stable at float32 precision regardless of horizon.
 """
@@ -275,8 +277,9 @@ def plan_action_continuous(
     """
     Sequential tanh-squash MPC for continuous action spaces, single state.
 
-    Uses manual in-place GD (u_logits.data -= lr * grad) instead of
-    optim.Adam — avoids Python optimizer overhead in the hot loop.
+    Uses Adam with manual grad assignment (u_logits.grad = grad; opt.step()) so
+    bias-corrected second-moment normalization kicks in even for short (10-iter)
+    planning horizons where raw GD underperforms due to small gradient magnitudes.
     frozen_b=True detaches B (isolates live- vs. frozen-B effect).
     Returns action ∈ [-1, 1]^action_dim (caller multiplies by action_scale).
     """
@@ -290,8 +293,10 @@ def plan_action_continuous(
         )
 
     u_logits = torch.zeros(horizon, action_dim, device=device, requires_grad=True)
+    opt      = optim.Adam([u_logits], lr=lr)
 
     for _ in range(plan_iters):
+        opt.zero_grad()
         z_t = z_start
         u   = torch.tanh(u_logits)
         for t in range(horizon):
@@ -299,7 +304,8 @@ def plan_action_continuous(
         loss = -agent.v_net(z_t).mean()
 
         (grad_u,) = torch.autograd.grad(loss, u_logits, only_inputs=True)
-        u_logits.data -= lr * grad_u   # in-place on .data — keeps u_logits a leaf
+        u_logits.grad = grad_u
+        opt.step()
 
     with torch.no_grad():
         return torch.tanh(u_logits[0]).cpu().numpy()
@@ -317,8 +323,8 @@ def plan_action_continuous_batch(
     """
     Batched sequential MPC: plans for N states simultaneously.
 
-    Encodes all N states in one forward pass; manual in-place GD over
-    u_logits [N, H, action_dim]. Returns actions [N, action_dim].
+    Encodes all N states in one forward pass; Adam over u_logits [N, H, action_dim].
+    Returns actions [N, action_dim].
     """
     device     = next(agent.parameters()).device
     action_dim = agent.B.shape[1]
@@ -331,8 +337,10 @@ def plan_action_continuous_batch(
         )  # [N, d]
 
     u_logits = torch.zeros(N, horizon, action_dim, device=device, requires_grad=True)
+    opt      = optim.Adam([u_logits], lr=lr)
 
     for _ in range(plan_iters):
+        opt.zero_grad()
         z_t = z_start
         u   = torch.tanh(u_logits)                         # [N, H, action_dim]
         for t in range(horizon):
@@ -340,7 +348,8 @@ def plan_action_continuous_batch(
         loss = -agent.v_net(z_t).mean()
 
         (grad_u,) = torch.autograd.grad(loss, u_logits, only_inputs=True)
-        u_logits.data -= lr * grad_u
+        u_logits.grad = grad_u
+        opt.step()
 
     with torch.no_grad():
         return (torch.tanh(u_logits[:, 0, :]) * action_scale).cpu().numpy()
@@ -366,7 +375,7 @@ def plan_action_toeplitz_continuous_batch(
     cached A_stack.
 
     Each grad step is one batched GEMM (X_flat @ W_toeplitz.T) instead of
-    N × H sequential dyn_step calls. Manual in-place GD avoids Adam overhead.
+    N × H sequential dyn_step calls. Uses Adam for bias-corrected normalization.
 
     cumulative=False: max V_ψ(z_H)               stable data collection
     cumulative=True:  max Σ_{t=1}^H γ^t V_ψ(z_t) better at eval
@@ -391,8 +400,10 @@ def plan_action_toeplitz_continuous_batch(
         ZIR = torch.einsum('kij,nj->nki', A_stack[1:], z0)        # [N, H, d]
 
     u_logits = torch.zeros(N, horizon, action_dim, device=device, requires_grad=True)
+    opt      = optim.Adam([u_logits], lr=lr)
 
     for _ in range(plan_iters):
+        opt.zero_grad()
         u      = torch.tanh(u_logits)                              # [N, H, action_dim]
         X_flat = (u @ B.T).reshape(N, horizon * d)                 # [N, H*d]
 
@@ -406,7 +417,8 @@ def plan_action_toeplitz_continuous_batch(
             loss = -agent.v_net(Z[:, -1, :]).mean()
 
         (grad_u,) = torch.autograd.grad(loss, u_logits, only_inputs=True)
-        u_logits.data -= lr * grad_u
+        u_logits.grad = grad_u
+        opt.step()
 
     with torch.no_grad():
         return (torch.tanh(u_logits[:, 0, :]) * action_scale).cpu().numpy()
