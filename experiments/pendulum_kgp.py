@@ -183,27 +183,32 @@ def load_checkpoint(path=None):
 
 class ContinuousReplayBuffer:
     def __init__(self, capacity: int, state_dim: int, action_dim: int):
-        self.capacity = capacity
-        self.states   = np.zeros((capacity, state_dim),  dtype=np.float32)
-        self.next_s   = np.zeros((capacity, state_dim),  dtype=np.float32)
-        self.actions  = np.zeros((capacity, action_dim), dtype=np.float32)
-        self.rewards  = np.zeros(capacity, dtype=np.float32)
-        self.dones    = np.zeros(capacity, dtype=np.float32)
+        self.capacity  = capacity
+        self.states    = np.zeros((capacity, state_dim),  dtype=np.float32)
+        self.next_s    = np.zeros((capacity, state_dim),  dtype=np.float32)
+        self.actions   = np.zeros((capacity, action_dim), dtype=np.float32)
+        self.rewards   = np.zeros(capacity, dtype=np.float32)
+        self.dones     = np.zeros(capacity, dtype=np.float32)  # terminated | truncated
+        self.terminals = np.zeros(capacity, dtype=np.float32)  # terminated only (for TD)
         self.ptr = self.size = 0
 
-    def push(self, s, a, r, ns, d):
-        self.states[self.ptr]  = s
-        self.next_s[self.ptr]  = ns
-        self.actions[self.ptr] = a
-        self.rewards[self.ptr] = r
-        self.dones[self.ptr]   = float(d)
-        self.ptr  = (self.ptr + 1) % self.capacity
-        self.size = min(self.size + 1, self.capacity)
+    def push_batch(self, states, actions, rewards, next_states, dones, terminals):
+        """Insert a batch of N transitions using modular index arithmetic."""
+        n   = len(states)
+        idx = np.arange(self.ptr, self.ptr + n) % self.capacity
+        self.states[idx]    = states
+        self.next_s[idx]    = next_states
+        self.actions[idx]   = actions
+        self.rewards[idx]   = rewards
+        self.dones[idx]     = dones.astype(np.float32)
+        self.terminals[idx] = terminals.astype(np.float32)
+        self.ptr  = (self.ptr + n) % self.capacity
+        self.size = min(self.size + n, self.capacity)
 
     def sample(self, n: int) -> dict:
         idx = np.random.randint(0, self.size, n)
         return {k: getattr(self, k)[idx]
-                for k in ("states", "next_s", "actions", "rewards", "dones")}
+                for k in ("states", "next_s", "actions", "rewards", "dones", "terminals")}
 
 
 # ---------------------------------------------------------------------------
@@ -927,58 +932,64 @@ def run_continuous_toeplitz(device: torch.device, n_steps: int = N_STEPS,
 
         next_states, rewards, terminated, truncated, infos = env.step(actions)
         dones = terminated | truncated
-        for i in range(N_ENVS):
-            # gymnasium auto-resets done envs; the final obs before reset is in infos
-            ns_i = (infos["final_observation"][i]
-                    if dones[i] and "final_observation" in infos
-                    else next_states[i])
-            buf.push(states[i], actions[i], rewards[i], ns_i, dones[i])
-            ep_returns[i] += rewards[i]
-            if dones[i]:
-                episode_returns.append(float(ep_returns[i]))
-                ep_returns[i] = 0.0
-                if ou_list is not None:
-                    ou_list[i].reset()
+
+        # For done envs, store the final obs before auto-reset (not the new episode's obs)
+        ns_buf = next_states.copy()
+        if "final_observation" in infos and isinstance(infos["final_observation"], np.ndarray):
+            ns_buf[dones] = infos["final_observation"][dones]
+
+        # dones = terminated|truncated masks Koopman loss (no dynamics across episode boundary)
+        # terminals = terminated only masks TD bootstrapping (truncation is not absorbing)
+        buf.push_batch(states, actions, rewards, ns_buf, dones, terminated)
+
+        ep_returns += rewards
+        for i in np.where(dones)[0]:
+            episode_returns.append(float(ep_returns[i]))
+            ep_returns[i] = 0.0
+            if ou_list is not None:
+                ou_list[i].reset()
         states = next_states
 
         if buf.size < BATCH_SIZE:
             continue
 
-        batch = buf.sample(BATCH_SIZE)
-        s_b, ns_b, a_b, r_b, d_b = (
-            torch.as_tensor(batch[k], device=device)
-            for k in ("states", "next_s", "actions", "rewards", "dones")
-        )
+        # N_ENVS gradient steps per loop iteration — maintains UTD ratio = 1
+        for _ in range(N_ENVS):
+            batch = buf.sample(BATCH_SIZE)
+            s_b, ns_b, a_b, r_b, d_b, t_b = (
+                torch.as_tensor(batch[k], device=device)
+                for k in ("states", "next_s", "actions", "rewards", "dones", "terminals")
+            )
 
-        z_src = agent.encode(s_b)
-        with torch.no_grad():
-            z_dst_tgt = target.encoder(ns_b)
+            z_src = agent.encode(s_b)
+            with torch.no_grad():
+                z_dst_tgt = target.encoder(ns_b)
 
-        # Koopman loss — linear dynamics (dyn_step skips normalisation when ortho_a=True)
-        z_pred = agent.dyn_step(z_src, a_b @ agent.B.T)
-        L_koop = ((z_pred - z_dst_tgt.detach()).pow(2)
-                  .sum(dim=-1) * (1.0 - d_b)).mean()
+            # Koopman loss — mask episode boundaries (terminated | truncated)
+            z_pred = agent.dyn_step(z_src, a_b @ agent.B.T)
+            L_koop = ((z_pred - z_dst_tgt.detach()).pow(2)
+                      .sum(dim=-1) * (1.0 - d_b)).mean()
 
-        # Reconstruction anchor
-        L_recon = (agent.decoder(z_src) - s_b).pow(2).mean()
+            # Reconstruction anchor
+            L_recon = (agent.decoder(z_src) - s_b).pow(2).mean()
 
-        # 1-step TD value loss
-        with torch.no_grad():
-            V_next = target.v_net(z_dst_tgt)
-            y_td   = r_b / REWARD_SCALE + GAMMA * V_next * (1.0 - d_b)
-        L_v = (agent.v_net(z_src) - y_td).pow(2).mean()
+            # 1-step TD — mask only true terminal states, not time-limit truncations
+            with torch.no_grad():
+                V_next = target.v_net(z_dst_tgt)
+                y_td   = r_b / REWARD_SCALE + GAMMA * V_next * (1.0 - t_b)
+            L_v = (agent.v_net(z_src) - y_td).pow(2).mean()
 
-        # Soft ortho penalty (MPS/CPU fallback; never applied on CUDA)
-        L_ortho = (agent.ortho_penalty()
-                   if (agent._ortho_a and not agent._use_hard_ortho)
-                   else torch.tensor(0.0, device=device))
+            # Soft ortho penalty (MPS/CPU fallback; never applied on CUDA)
+            L_ortho = (agent.ortho_penalty()
+                       if (agent._ortho_a and not agent._use_hard_ortho)
+                       else torch.tensor(0.0, device=device))
 
-        loss = LAMBDA_KOOP * L_koop + LAMBDA_RECON * L_recon + LAMBDA_V * L_v + L_ortho
-        opt.zero_grad()
-        loss.backward()
-        nn.utils.clip_grad_norm_(agent.parameters(), max_norm=10.0)
-        opt.step()
-        target.update(agent, tau=EMA_TAU)
+            loss = LAMBDA_KOOP * L_koop + LAMBDA_RECON * L_recon + LAMBDA_V * L_v + L_ortho
+            opt.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(agent.parameters(), max_norm=10.0)
+            opt.step()
+            target.update(agent, tau=EMA_TAU)
 
         recent_koop.append(L_koop.item())
         recent_v.append(L_v.item())
