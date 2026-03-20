@@ -63,10 +63,7 @@ class Encoder(nn.Module):
         nn.init.zeros_(last_linear.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out = self.net(x)
-        if self.tanh_out or getattr(self, "no_normalize", False):
-            return out
-        return F.normalize(out, dim=-1)
+        return self.net(x)
 
 
 class QNetwork(nn.Module):
@@ -196,17 +193,13 @@ class KoopmanGradientPlanner(nn.Module):
 
     def dyn_step(self, z: torch.Tensor, b_vec: torch.Tensor) -> torch.Tensor:
         """
-        One Koopman step: z' = A z + b_vec  [+ optional normalisation].
+        One Koopman step: z' = A z + b_vec  
 
-        ortho_a=False: normalises z' to S^{d-1} (original Koopman approach).
-        ortho_a=True:  fully linear — no normalisation. A is orthonormal so
-                       ||A z|| = ||z||; only B a perturbs the norm.
 
         All callers (planner, train loop, act) go through here so switching
         modes requires changing only the config, not any call site.
         """
-        raw = z @ self.A.T + b_vec
-        return raw if self._ortho_a else F.normalize(raw, dim=-1)
+        return z @ self.A.T + b_vec
 
     def koop_parameters(self) -> list:
         """Parameter list for the Koopman optimizer group (A and B).
