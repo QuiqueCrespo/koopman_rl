@@ -145,7 +145,9 @@ def train_continuous(
             actions = np.random.uniform(-action_scale, action_scale,
                                         (n_envs, action_dim)).astype(np.float32)
         else:
-            actions = agent.act_policy_continuous_batch(states, action_scale)
+            # actions = agent.act_policy_continuous_batch(states, action_scale)
+            actions = agent.act_plan_continuous(
+                states, plan_horizon, plan_iters, gamma=gamma, action_scale=action_scale)
             if ou_noise:
                 exploration = np.stack([ou_list[i].sample(sigma=noise * action_scale)
                                         for i in range(n_envs)])
@@ -278,10 +280,6 @@ def train_continuous(
     planners = [
         ("direct policy         ",
          lambda ss: agent.act_policy_continuous_batch(ss, action_scale)),
-        ("sequential MPC (R+Q)  ",
-         lambda ss: agent.act_plan_continuous_batch(
-             ss, plan_horizon, plan_iters, action_scale=action_scale,
-             frozen_b=frozen_b)),
         ("toeplitz MPC (r_net+Q)",
          lambda ss: agent.act_plan_toeplitz_continuous_batch(
              ss, plan_horizon, plan_iters, gamma=gamma, action_scale=action_scale)),

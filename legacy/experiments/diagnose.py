@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from env    import N_ACTIONS, STATE_DIM, GOAL_X, GOAL_Y, ACTION_NAMES, ACTION_COLORS, GravityBasin
-from model  import KoopmanAgent, TargetNetwork, D
+from model  import KoopmanGradientPlanner, TargetNetwork, D
 from losses import GAMMA
 
 
@@ -98,7 +98,7 @@ class DiagnosticHook:
 
     def __init__(
         self,
-        agent      : KoopmanAgent,
+        agent      : KoopmanGradientPlanner,
         target     : TargetNetwork,
         n_probe    : int = 256,
         probe_seed : int = 0,
@@ -544,8 +544,8 @@ def main():
     history = train(n_steps_override=10_000, hook=None)  # hook wired in train.py
 
     # Standalone: build a fresh agent and test hook construction
-    from model import KoopmanAgent, TargetNetwork
-    agent  = KoopmanAgent()
+    from model import KoopmanGradientPlanner, TargetNetwork
+    agent  = KoopmanGradientPlanner()
     target = TargetNetwork(agent)
     hook   = DiagnosticHook(agent, target, n_probe=64)
 

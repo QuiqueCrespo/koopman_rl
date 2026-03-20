@@ -9,7 +9,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 
 from env    import GravityBasin, N_ACTIONS, STATE_DIM, MAX_EP_STEPS
-from model  import KoopmanAgent, TargetNetwork, D, LR
+from model  import KoopmanGradientPlanner, TargetNetwork, D, LR
 from buffer import ReplayBuffer, B, T_CHUNK
 from losses import (compute_v_targets, compute_bisimulation_loss,
                     compute_contrastive_loss, compute_isometric_loss,
@@ -33,7 +33,7 @@ def train(hook=None, n_steps_override: int = None) -> dict:
     """
     env    = GravityBasin()
     buf    = ReplayBuffer()
-    agent  = KoopmanAgent()
+    agent  = KoopmanGradientPlanner()
     target = TargetNetwork(agent)
     opt    = optim.Adam(agent.parameters(), lr=LR)
 
@@ -187,7 +187,7 @@ def train(hook=None, n_steps_override: int = None) -> dict:
     }
 
 
-def evaluate(agent: KoopmanAgent, n_episodes: int = 100) -> tuple[float, float]:
+def evaluate(agent: KoopmanGradientPlanner, n_episodes: int = 100) -> tuple[float, float]:
     """Greedy policy rollout. Returns (success_rate, mean_steps_on_success)."""
     env = GravityBasin()
     successes, steps_list = 0, []

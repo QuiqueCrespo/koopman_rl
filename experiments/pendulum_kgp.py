@@ -37,8 +37,8 @@ from koopman_rl.trainer_continuous import train_continuous
 # ---------------------------------------------------------------------------
 ACTION_DIM       = 1
 ACTION_SCALE     = 2.0
-PLAN_HORIZON     = 5
-PLAN_ITERS       = 15
+PLAN_HORIZON     = 20
+PLAN_ITERS       = 50
 VIZ_PLAN_HORIZON = 20   # longer horizon for viz plan rollouts (offline)
 VIZ_PLAN_ITERS   = 50   # more iters for viz (no speed pressure)
 VIZ_DIR          = "output/viz/pendulum"
@@ -75,7 +75,7 @@ def make_pendulum_cfg(args) -> Config:
         ),
         buffer=BufferConfig(
             capacity=100_000,
-            batch_size=256,
+            batch_size=512,
         ),
         algo=AlgoConfig(
             gamma=0.99,
@@ -88,7 +88,7 @@ def make_pendulum_cfg(args) -> Config:
         ),
         train=TrainConfig(
             n_steps=args.steps,
-            warmup=10_000,
+            warmup=15_000,
             noise_start=1.0,
             noise_end=0.1,
             noise_decay=15_000,
@@ -572,7 +572,7 @@ if __name__ == "__main__":
     parser.add_argument("--ou_noise", action="store_true",
                         help="Use Ornstein-Uhlenbeck noise instead of i.i.d. Gaussian")
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--steps", type=int, default=50_000)
+    parser.add_argument("--steps", type=int, default=70_000)
     parser.add_argument("--device", default="auto")
     args = parser.parse_args()
 

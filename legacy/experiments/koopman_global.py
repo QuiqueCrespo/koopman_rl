@@ -30,7 +30,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from gravity_basin import (
-    GravityBasin, Encoder, ValueNetwork, KoopmanAgent, TargetNetwork,
+    GravityBasin, Encoder, ValueNetwork, KoopmanGradientPlanner, TargetNetwork,
     ReplayBuffer, compute_bisimulation_loss, evaluate,
     N_ACTIONS, STATE_DIM, D, GAMMA, EMA_TAU, LR, MAX_EP_STEPS,
     LAMBDA_KOOP, LAMBDA_BISIM, BUFFER_SIZE,
@@ -340,7 +340,7 @@ def build_incidence_coo(
 # ---------------------------------------------------------------------------
 
 def build_and_diffuse(
-    agent:        KoopmanAgent,
+    agent:        KoopmanGradientPlanner,
     target:       TargetNetwork,
     buf:          ReplayBuffer,
     graph_device: torch.device,   # kept for API compat; diffusion now runs on train_device
@@ -503,7 +503,7 @@ def train() -> dict:
     """
     env    = GravityBasin()
     buf    = ReplayBuffer(capacity=BUFFER_SIZE)
-    agent  = KoopmanAgent()
+    agent  = KoopmanGradientPlanner()
     target = TargetNetwork(agent)
 
     # Two param groups: neural params at LR, dynamics (A, B) at lower LR + WD
@@ -515,7 +515,7 @@ def train() -> dict:
     ])
 
     # Move agent and target to DEVICE for neural forward passes.
-    # Note: gravity_basin.KoopmanAgent.act() creates a hard-coded CPU tensor,
+    # Note: gravity_basin.KoopmanGradientPlanner.act() creates a hard-coded CPU tensor,
     # so for DEVICE != cpu we wrap act() to move the input tensor to DEVICE.
     agent.to(DEVICE)
     target.encoder.to(DEVICE)
@@ -909,7 +909,7 @@ def _smooth(x, w=10):
 
 def plot_live(
     step:            int,
-    agent:           "KoopmanAgent",
+    agent:           "KoopmanGradientPlanner",
     koop_losses:     list,
     v_losses:        list,
     bisim_losses:    list,

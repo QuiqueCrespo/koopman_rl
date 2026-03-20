@@ -80,7 +80,7 @@ class DQNBuffer:
 # ---------------------------------------------------------------------------
 
 class DQNAgent(nn.Module):
-    """Same capacity as KoopmanAgent minus the K_a ParameterList."""
+    """Same capacity as KoopmanGradientPlanner minus the K_a ParameterList."""
     def __init__(self):
         super().__init__()
         self.encoder = Encoder(STATE_DIM, D)

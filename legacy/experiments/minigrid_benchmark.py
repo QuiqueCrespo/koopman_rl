@@ -182,7 +182,7 @@ class QNetwork(nn.Module):
 # Agents
 # ---------------------------------------------------------------------------
 
-class KoopmanAgent(nn.Module):
+class KoopmanGradientPlanner(nn.Module):
     def __init__(self, d: int):
         super().__init__()
         self.d       = d
@@ -388,7 +388,7 @@ def train_koopman(cfg: dict, label: str, results_dir: pathlib.Path = None) -> di
 
     env    = ImgObsWrapper(gym.make(cfg["env_id"], max_steps=max_steps))
     buf    = ReplayBuffer()
-    agent  = KoopmanAgent(d).to(DEVICE)
+    agent  = KoopmanGradientPlanner(d).to(DEVICE)
     target = TargetNet(agent)
     # K_a gets weight_decay as a soft spectral penalty; encoder+Q-net do not.
     opt = optim.Adam([

@@ -19,7 +19,7 @@ MAX_EP_STEPS = ORBIT_MAX_EP_STEPS
 from env import N_ACTIONS, STATE_DIM, DELTA, ACTION_NAMES, ACTION_COLORS
 
 # ---- model, buffer, losses — unchanged ----------------------------------
-from model import Encoder, ValueNetwork, QNetwork, KoopmanAgent, TargetNetwork, D, LR, EMA_TAU
+from model import Encoder, ValueNetwork, QNetwork, KoopmanGradientPlanner, TargetNetwork, D, LR, EMA_TAU
 from buffer import ReplayBuffer, BUFFER_SIZE, B, T_CHUNK
 from losses import (
     compute_contrastive_loss, compute_isometric_loss,

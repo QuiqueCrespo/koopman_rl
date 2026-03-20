@@ -23,13 +23,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.nn.utils.parametrize as parametrize
+import torch.optim as optim
 
-from koopman_rl.config import Config, ModelConfig, EnvConfig
+
+from koopman_rl.config import Config
 from koopman_rl.planner import (
     _build_w_toeplitz,
-    plan_action_gumbel, plan_action_toeplitz,
-    plan_action_continuous, plan_action_continuous_batch,
-    plan_action_toeplitz_continuous_batch,
+    plan_action_gumbel
 )
 
 # Module-level defaults (backward compat)
@@ -302,53 +302,80 @@ class KoopmanGradientPlanner(nn.Module):
         """Gumbel-Softmax MPC — discrete environments."""
         return plan_action_gumbel(self, state, horizon, plan_iters, tau=tau)
 
-    def act_plan_toeplitz(self, state: np.ndarray,
-                          horizon: int = 10, plan_iters: int = 20,
-                          lr: float = 0.1, tau: float = 1.0,
-                          gamma: float = 0.95) -> int:
-        """Block-Toeplitz GEMM planner — requires ortho_a=True.
-        Pre-computes ZIR and W_toeplitz outside the Adam loop; each iteration
-        is a single dense GEMM instead of H sequential dyn_step calls."""
-        return plan_action_toeplitz(self, state, horizon, plan_iters,
-                                    lr=lr, tau=tau, gamma=gamma)
+    def act_plan_continuous(
+        agent,
+        states:       np.ndarray,
+        horizon:      int   = 10,
+        plan_iters:   int   = 20,
+        lr:           float = 0.1,
+        gamma:        float = 0.95,
+        action_scale: float = 1.0,
+    ) -> np.ndarray:
+        """
+        Batched Block-Toeplitz GEMM planner for continuous action spaces.
 
-    def act_plan_continuous(self, state: np.ndarray,
-                            horizon: int = 10, plan_iters: int = 20,
-                            action_scale: float = 1.0,
-                            frozen_b: bool = False) -> np.ndarray:
-        """tanh-squash MPC — continuous environments. Returns action ∈ [-scale, scale]^d."""
-        return plan_action_continuous(self, state, horizon, plan_iters,
-                                      frozen_b=frozen_b) * action_scale
+        Objective: Σ_{t=0}^{H-1} γ^t r_net(z_t, u_t)  +  γ^H Q(z_H, π(z_H))
+        - Path costs come from r_net (no bootstrap, stable gradient).
+        - Terminal uses Q + π to estimate future value beyond the horizon.
 
-    def act_plan_toeplitz_continuous(self, state: np.ndarray,
-                                     horizon: int = 10, plan_iters: int = 20,
-                                     gamma: float = 0.95, action_scale: float = 1.0) -> np.ndarray:
-        """Block-Toeplitz GEMM MPC — continuous environments, requires ortho_a=True.
-        Uses discounted r_net path costs + Q(z_H, π(z_H)) terminal."""
-        return plan_action_toeplitz_continuous_batch(
-            self, state[np.newaxis], horizon, plan_iters,
-            gamma=gamma, action_scale=action_scale,
-        )[0]
+        W_toeplitz and A_stack read from agent.get_toeplitz_cache() — built once
+        per (horizon, gamma) key; each plan_iter is a single batched GEMM.
 
-    def act_plan_toeplitz_continuous_batch(self, states: np.ndarray,
-                                           horizon: int = 10, plan_iters: int = 20,
-                                           gamma: float = 0.95, action_scale: float = 1.0) -> np.ndarray:
-        """Batched Block-Toeplitz GEMM MPC for N states. W_toeplitz built once.
-        Returns [N, action_dim]. Requires ortho_a=True."""
-        return plan_action_toeplitz_continuous_batch(self, states, horizon, plan_iters,
-                                                     gamma=gamma, action_scale=action_scale)
+        Returns actions [N, action_dim] ∈ [-action_scale, action_scale].
+        Requires ortho_a=True (linear superposition Z = ZIR + W X must hold).
+        """
+        device     = next(agent.parameters()).device
+        d          = agent.d
+        action_dim = agent.B.shape[1]
+        N          = len(states)
 
-    def act_plan_continuous_batch(self, states: np.ndarray,
-                                  horizon: int = 10, plan_iters: int = 20,
-                                  action_scale: float = 1.0,
-                                  frozen_b: bool = False) -> np.ndarray:
-        """Batched sequential MPC for N states. Returns [N, action_dim]."""
-        return plan_action_continuous_batch(self, states, horizon, plan_iters,
-                                            action_scale=action_scale, frozen_b=frozen_b)
+        with torch.no_grad():
+            z0 = agent.encoder(
+                torch.tensor(states, dtype=torch.float32, device=device)
+            )                                                          # [N, d]
+
+            B = agent.B.detach()                                       # [d, action_dim]
+
+            # W_toeplitz and A_stack come from cache — free if A hasn't changed
+            W_toeplitz, _, A_stack = agent.get_toeplitz_cache(horizon, gamma)
+            ZIR = torch.einsum('kij,nj->nki', A_stack[1:], z0)        # [N, H, d]
+
+        # γ^0 … γ^{H-1} for path discounting
+        gammas_path = gamma ** torch.arange(horizon, device=device, dtype=torch.float32)
+
+        u_logits = torch.zeros(N, horizon, action_dim, device=device, requires_grad=True)
+        opt      = optim.Adam([u_logits], lr=lr)
+
+        for _ in range(plan_iters):
+            opt.zero_grad()
+            u      = torch.tanh(u_logits)                              # [N, H, action_dim]
+            X_flat = (u @ B.T).reshape(N, horizon * d)                 # [N, H*d]
+
+            # Single batched GEMM replaces N × H sequential dyn_step calls
+            Z = ZIR + (X_flat @ W_toeplitz.T).reshape(N, horizon, d)  # [N, H, d]
+
+            # Explicit path rewards from r_net
+            ZU           = torch.cat([Z, u], dim=-1)                   # [N, H, d+action_dim]
+            path_rewards = agent.r_net(ZU).squeeze(-1)                 # [N, H]
+            disc_path    = (gammas_path.unsqueeze(0) * path_rewards).sum(dim=1)  # [N]
+
+            # Terminal Q: Q(z_H, π(z_H)) — gradient flows through z_H and π
+            z_H  = Z[:, -1, :]                                         # [N, d]
+            a_H  = agent.pi_net(z_H)                                   # [N, action_dim]
+            q_H  = agent.q_net(torch.cat([z_H, a_H], -1)).squeeze(-1) # [N]
+
+            loss = -(disc_path + gamma ** horizon * q_H).mean()
+
+            (grad_u,) = torch.autograd.grad(loss, u_logits, only_inputs=True)
+            u_logits.grad = grad_u
+            opt.step()
+
+        with torch.no_grad():
+            return (torch.tanh(u_logits[:, 0, :]) * action_scale).cpu().numpy()
 
 
-# Backward-compatibility alias: KoopmanAgent is an alias for KoopmanGradientPlanner
-KoopmanAgent = KoopmanGradientPlanner
+
+
 
 
 class TargetNetwork:
