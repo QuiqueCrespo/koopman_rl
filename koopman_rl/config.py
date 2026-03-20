@@ -33,7 +33,7 @@ class ModelConfig:
 @dataclass
 class BufferConfig:
     capacity:   int = 100_000
-    batch_size: int = 256
+    batch_size: int = 512
 
 
 @dataclass
