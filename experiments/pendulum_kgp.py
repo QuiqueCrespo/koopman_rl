@@ -58,7 +58,7 @@ LAMBDA_KOOP  = 1.0
 LAMBDA_RECON = 0.5
 LAMBDA_V     = 1.0
 EMA_TAU      = 0.005
-PLAN_HORIZON     = 20     # horizon during training (speed)
+PLAN_HORIZON     = 5      # horizon during training — short keeps plan quality high on untrained model
 PLAN_ITERS       = 10    # gradient iters during training
 VIZ_PLAN_HORIZON = 20    # longer horizon for viz plan rollouts
 VIZ_PLAN_ITERS   = 50    # more iters for viz (offline, no speed pressure)
@@ -1014,31 +1014,29 @@ def run_continuous_toeplitz(device: torch.device, n_steps: int = N_STEPS,
     print(f"  H={PLAN_HORIZON}  iters={PLAN_ITERS}  γ={GAMMA}")
     print("=" * 64)
 
-    eval_env = gym.make("Pendulum-v1")
+    # Run all N_EVAL_PLAN episodes in parallel — Pendulum is always exactly 200 steps
+    # (time-limited, never terminates early), so a fixed 200-step loop is exact.
+    eval_env = gym.make_vec("Pendulum-v1", num_envs=N_EVAL_PLAN)
     planners = [
         ("sequential (baseline)",
-         lambda s: plan_action_continuous(agent, s, PLAN_HORIZON, PLAN_ITERS)),
+         lambda ss: agent.act_plan_continuous_batch(
+             ss, PLAN_HORIZON, PLAN_ITERS, action_scale=ACTION_SCALE)),
         ("toeplitz  (GEMM)",
-         lambda s: plan_action_toeplitz_continuous(agent, s, PLAN_HORIZON, PLAN_ITERS,
-                                                   gamma=GAMMA, action_scale=ACTION_SCALE,
-                                                   cumulative=False)),
+         lambda ss: agent.act_plan_toeplitz_continuous_batch(
+             ss, PLAN_HORIZON, PLAN_ITERS,
+             gamma=GAMMA, action_scale=ACTION_SCALE, cumulative=False)),
     ]
 
     for name, fn in planners:
         t_plan = time.time()
-        rets = []
-        for _ in range(N_EVAL_PLAN):
-            s, _ = eval_env.reset()
-            ret = 0.0
-            for _ in range(200):
-                a = fn(s)
-                s, r, term, trunc, _ = eval_env.step(a)
-                ret += r
-                if term or trunc:
-                    break
-            rets.append(ret)
+        ss, _ = eval_env.reset()
+        ep_rets = np.zeros(N_EVAL_PLAN, dtype=np.float32)
+        for _ in range(200):
+            actions = fn(ss).astype(np.float32)
+            ss, rewards, _, _, _ = eval_env.step(actions)
+            ep_rets += rewards
         elapsed = time.time() - t_plan
-        print(f"  {name:30s}  mean={np.mean(rets):8.1f}  std={np.std(rets):6.1f}"
+        print(f"  {name:30s}  mean={ep_rets.mean():8.1f}  std={ep_rets.std():6.1f}"
               f"  wall={elapsed:.1f}s  ({elapsed/N_EVAL_PLAN:.2f}s/ep)")
 
     eval_env.close()
