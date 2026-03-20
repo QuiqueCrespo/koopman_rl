@@ -1020,7 +1020,8 @@ def run_continuous_toeplitz(device: torch.device, n_steps: int = N_STEPS,
          lambda s: plan_action_continuous(agent, s, PLAN_HORIZON, PLAN_ITERS)),
         ("toeplitz  (GEMM)",
          lambda s: plan_action_toeplitz_continuous(agent, s, PLAN_HORIZON, PLAN_ITERS,
-                                                   gamma=GAMMA, action_scale=ACTION_SCALE)),
+                                                   gamma=GAMMA, action_scale=ACTION_SCALE,
+                                                   cumulative=False)),
     ]
 
     for name, fn in planners:

@@ -356,7 +356,7 @@ def plan_action_toeplitz(
         W_toeplitz = W_blocks.permute(0, 2, 1, 3).reshape(horizon * d, horizon * d)
 
         # Discount weights γ¹ … γᴴ
-        gammas = (gamma ** torch.arange(1, horizon + 1, device=device)).unsqueeze(1)
+        gammas = (gamma ** torch.arange(1, horizon + 1, device=device))  # [H]
 
     B = agent.B.detach()  # [d, n_acts]
 
@@ -468,7 +468,7 @@ class WarmStartToeplitzPlanner:
             W_toeplitz = W_blocks.permute(0, 2, 1, 3).reshape(H * d, H * d)
 
             gammas = (self.gamma ** torch.arange(1, H + 1, device=device,
-                                                 dtype=torch.float64)).unsqueeze(1)
+                                                 dtype=torch.float64))  # [H]
 
         for _ in range(self.plan_iters):
             opt.zero_grad()
@@ -544,7 +544,7 @@ def plan_action_toeplitz_continuous(
         W_toeplitz = W_blocks.permute(0, 2, 1, 3).reshape(horizon * d, horizon * d)
 
         gammas = (gamma ** torch.arange(1, horizon + 1, device=device,
-                                        dtype=torch.float64)).unsqueeze(1)
+                                        dtype=torch.float64))  # [H]
 
     u_logits = torch.randn(horizon, action_dim, device=device,
                            dtype=torch.float64) * 1e-4
