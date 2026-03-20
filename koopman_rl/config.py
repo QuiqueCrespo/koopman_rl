@@ -89,8 +89,7 @@ class TrainConfig:
     viz_every:    int   = 5_000
     viz_dir:      str   = "output/viz"
     ckpt_dir:     str   = "output/checkpoints"
-    planner_type: str   = "toeplitz"   # "toeplitz" | "sequential"
-    cumulative:   bool  = False        # cumulative vs terminal value objective
+    planner_type: str   = "policy"     # data collection always uses policy; benchmark: "policy" | "toeplitz" | "sequential"
     frozen_b:     bool  = False        # detach B in sequential planner
     ou_noise:     bool  = False        # Ornstein-Uhlenbeck vs i.i.d. Gaussian
 
