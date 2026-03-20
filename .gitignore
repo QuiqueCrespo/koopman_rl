@@ -3,6 +3,7 @@ output/
 
 # Python
 __pycache__/
+koopman_rl/__pycache__/
 *.pyc
 *.pyo
 *.egg-info/
