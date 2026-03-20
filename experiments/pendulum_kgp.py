@@ -36,7 +36,9 @@ from matplotlib.collections import LineCollection
 from matplotlib.gridspec import GridSpec
 
 from koopman_rl.model import KoopmanGradientPlanner, TargetNetwork
-
+from koopman_rl.planner import (plan_action_continuous,
+                                   plan_action_toeplitz_continuous,
+                                   WarmStartToeplitzPlanner)
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -58,7 +60,7 @@ LAMBDA_KOOP  = 1.0
 LAMBDA_RECON = 0.5
 LAMBDA_V     = 1.0
 EMA_TAU      = 0.005
-PLAN_HORIZON     = 20     # horizon during training (speed)
+PLAN_HORIZON     = 5     # horizon during training (speed)
 PLAN_ITERS       = 10    # gradient iters during training
 VIZ_PLAN_HORIZON = 20    # longer horizon for viz plan rollouts
 VIZ_PLAN_ITERS   = 50    # more iters for viz (offline, no speed pressure)
@@ -70,7 +72,7 @@ CKPT_DIR         = "output/checkpoints/pendulum"
 # Discrete-action Toeplitz test
 N_DISC_ACTIONS = 9   # torque levels uniformly spaced in [-ACTION_SCALE, ACTION_SCALE]
 N_EVAL_PLAN    = 20  # episodes per planner in the speed/quality benchmark
-N_ENVS         = 8   # parallel envs for vectorised collection (must divide 1k/5k/10k/20k)
+N_ENVS         = 1   # parallel envs for vectorised collection (must divide 1k/5k/10k/20k)
 
 os.makedirs(VIZ_DIR,  exist_ok=True)
 os.makedirs(CKPT_DIR, exist_ok=True)
@@ -840,10 +842,7 @@ def run_continuous_toeplitz(device: torch.device, n_steps: int = N_STEPS,
     At the end, benchmarks plan_action_continuous vs plan_action_toeplitz_continuous
     over N_EVAL_PLAN episodes each, reporting quality (mean return) and wall time.
     """
-    from koopman_rl.model import KoopmanGradientPlanner, TargetNetwork
-    from koopman_rl.planner import (plan_action_continuous,
-                                   plan_action_toeplitz_continuous,
-                                   WarmStartToeplitzPlanner)
+    
 
     random.seed(seed)
     np.random.seed(seed)
