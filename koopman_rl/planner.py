@@ -301,7 +301,9 @@ def plan_action_continuous(
         u   = torch.tanh(u_logits)
         for t in range(horizon):
             z_t = agent.dyn_step(z_t, (B @ u[t]).unsqueeze(0))
-        loss = -agent.v_net(z_t).mean()
+        # Terminal: Q(z_H, π(z_H))
+        a_t  = agent.pi_net(z_t)
+        loss = -agent.q_net(torch.cat([z_t, a_t], -1)).mean()
 
         (grad_u,) = torch.autograd.grad(loss, u_logits, only_inputs=True)
         u_logits.grad = grad_u
@@ -345,7 +347,9 @@ def plan_action_continuous_batch(
         u   = torch.tanh(u_logits)                         # [N, H, action_dim]
         for t in range(horizon):
             z_t = agent.dyn_step(z_t, u[:, t, :] @ B.T)  # [N, d] → [N, d]
-        loss = -agent.v_net(z_t).mean()
+        # Terminal: Q(z_H, π(z_H))
+        a_t  = agent.pi_net(z_t)
+        loss = -agent.q_net(torch.cat([z_t, a_t], -1)).mean()
 
         (grad_u,) = torch.autograd.grad(loss, u_logits, only_inputs=True)
         u_logits.grad = grad_u
@@ -363,22 +367,16 @@ def plan_action_toeplitz_continuous_batch(
     lr:           float = 0.1,
     gamma:        float = 0.95,
     action_scale: float = 1.0,
-    cumulative:   bool  = True,
 ) -> np.ndarray:
     """
     Batched Block-Toeplitz GEMM planner for continuous action spaces.
 
-    W_toeplitz and A_stack are read from agent.get_toeplitz_cache() — built
-    once per (horizon, gamma) key, shared across all N states and across all
-    planning calls until the trainer invalidates the cache after opt.step().
-    ZIR (state-dependent) is computed per call via a cheap einsum over the
-    cached A_stack.
+    Objective: Σ_{t=0}^{H-1} γ^t r_net(z_t, u_t)  +  γ^H Q(z_H, π(z_H))
+      - Path costs come from r_net (no bootstrap, stable gradient).
+      - Terminal uses Q + π to estimate future value beyond the horizon.
 
-    Each grad step is one batched GEMM (X_flat @ W_toeplitz.T) instead of
-    N × H sequential dyn_step calls. Uses Adam for bias-corrected normalization.
-
-    cumulative=False: max V_ψ(z_H)               stable data collection
-    cumulative=True:  max Σ_{t=1}^H γ^t V_ψ(z_t) better at eval
+    W_toeplitz and A_stack read from agent.get_toeplitz_cache() — built once
+    per (horizon, gamma) key; each plan_iter is a single batched GEMM.
 
     Returns actions [N, action_dim] ∈ [-action_scale, action_scale].
     Requires ortho_a=True (linear superposition Z = ZIR + W X must hold).
@@ -396,8 +394,11 @@ def plan_action_toeplitz_continuous_batch(
         B = agent.B.detach()                                       # [d, action_dim]
 
         # W_toeplitz and A_stack come from cache — free if A hasn't changed
-        W_toeplitz, gammas, A_stack = agent.get_toeplitz_cache(horizon, gamma)
+        W_toeplitz, _, A_stack = agent.get_toeplitz_cache(horizon, gamma)
         ZIR = torch.einsum('kij,nj->nki', A_stack[1:], z0)        # [N, H, d]
+
+    # γ^0 … γ^{H-1} for path discounting
+    gammas_path = gamma ** torch.arange(horizon, device=device, dtype=torch.float32)
 
     u_logits = torch.zeros(N, horizon, action_dim, device=device, requires_grad=True)
     opt      = optim.Adam([u_logits], lr=lr)
@@ -410,11 +411,17 @@ def plan_action_toeplitz_continuous_batch(
         # Single batched GEMM replaces N × H sequential dyn_step calls
         Z = ZIR + (X_flat @ W_toeplitz.T).reshape(N, horizon, d)  # [N, H, d]
 
-        if cumulative:
-            v_vals = agent.v_net(Z.reshape(N * horizon, d)).reshape(N, horizon)
-            loss   = -(gammas.unsqueeze(0) * v_vals).sum()
-        else:
-            loss = -agent.v_net(Z[:, -1, :]).mean()
+        # Explicit path rewards from r_net
+        ZU           = torch.cat([Z, u], dim=-1)                   # [N, H, d+action_dim]
+        path_rewards = agent.r_net(ZU).squeeze(-1)                 # [N, H]
+        disc_path    = (gammas_path.unsqueeze(0) * path_rewards).sum(dim=1)  # [N]
+
+        # Terminal Q: Q(z_H, π(z_H)) — gradient flows through z_H and π
+        z_H  = Z[:, -1, :]                                         # [N, d]
+        a_H  = agent.pi_net(z_H)                                   # [N, action_dim]
+        q_H  = agent.q_net(torch.cat([z_H, a_H], -1)).squeeze(-1) # [N]
+
+        loss = -(disc_path + gamma ** horizon * q_H).mean()
 
         (grad_u,) = torch.autograd.grad(loss, u_logits, only_inputs=True)
         u_logits.grad = grad_u

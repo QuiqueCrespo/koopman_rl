@@ -54,17 +54,11 @@ def make_pendulum_cfg(args) -> Config:
     """Build Config from parsed argparse args."""
     sequential = args.sequential
     frozen_b   = args.frozen_b
-    cumulative = args.cumulative
     ou_noise   = args.ou_noise
     seed       = args.seed
 
-    planner_tag = "seq" if sequential else "toe"
-    if sequential and frozen_b:
-        planner_tag = "seq_frozb"
-    if not sequential and cumulative:
-        planner_tag = "toe_cumul"
     noise_tag = "_ou" if ou_noise else ""
-    run_name  = f"pendulum_{planner_tag}{noise_tag}_s{seed}"
+    run_name  = f"pendulum_policy{noise_tag}_s{seed}"
 
     return Config(
         env=EnvConfig(
@@ -101,8 +95,7 @@ def make_pendulum_cfg(args) -> Config:
             viz_every=5_000,
             viz_dir=VIZ_DIR,
             ckpt_dir="output/checkpoints/pendulum",
-            planner_type="sequential" if sequential else "toeplitz",
-            cumulative=cumulative,
+            planner_type="policy",
             frozen_b=frozen_b,
             ou_noise=ou_noise,
         ),
@@ -129,7 +122,9 @@ def _to_theta_thetadot(states: np.ndarray):
 
 def _value_grid(agent, n_theta=60, n_tdot=50):
     """
-    Evaluate V_ψ(enc(s)) over a regular (θ, θ̇) grid.
+    Evaluate value over a regular (θ, θ̇) grid.
+    Continuous agent: Q(enc(s), π(enc(s))) — on-policy Q-value.
+    Discrete agent:   V(enc(s)).
     Returns theta_vals, tdot_vals, V_grid [n_tdot, n_theta].
     """
     agent.eval()
@@ -147,7 +142,11 @@ def _value_grid(agent, n_theta=60, n_tdot=50):
     device = next(agent.parameters()).device
     with torch.no_grad():
         z = agent.encode(torch.tensor(grid_np, device=device))
-        v = agent.v_net(z).cpu().numpy()
+        if hasattr(agent, 'q_net') and hasattr(agent, 'pi_net'):
+            a = agent.pi_net(z)
+            v = agent.q_net(torch.cat([z, a], -1)).squeeze(-1).cpu().numpy()
+        else:
+            v = agent.v_net(z).cpu().numpy()
 
     V_grid = v.reshape(n_tdot, n_theta)
     return theta_vals, tdot_vals, V_grid
@@ -182,7 +181,12 @@ def _decode_plan_rollout_dyn(agent, start_state: np.ndarray,
         u   = torch.tanh(u_logits)
         for t in range(horizon):
             z_t = agent.dyn_step(z_t, (agent.B @ u[t]).unsqueeze(0))
-        loss = -agent.v_net(z_t).mean()
+        # Terminal: Q(z_H, π(z_H)) for continuous; V(z_H) for discrete
+        if hasattr(agent, 'q_net') and hasattr(agent, 'pi_net'):
+            a_t  = agent.pi_net(z_t)
+            loss = -agent.q_net(torch.cat([z_t, a_t], -1)).mean()
+        else:
+            loss = -agent.v_net(z_t).mean()
         (g,) = torch.autograd.grad(loss, u_logits, only_inputs=True)
         u_logits.grad = g
         opt_p.step()
@@ -210,9 +214,8 @@ def _run_real_episode(agent, cfg, max_steps=200):
     s, _ = ev.reset()
     states, ret = [s.copy()], 0.0
     for _ in range(max_steps):
-        a = agent.act_plan_continuous(s, horizon=cfg.planner.horizon,
-                                      plan_iters=cfg.planner.plan_iters,
-                                      action_scale=cfg.env.action_scale)
+        a = agent.act_policy_continuous_batch(
+            s[np.newaxis], action_scale=cfg.env.action_scale)[0]
         s, r, term, trunc, _ = ev.step(a)
         states.append(s.copy())
         ret += r
@@ -233,9 +236,8 @@ def _render_episode(agent, cfg, n_frames: int = 8):
     all_frames, ret = [], 0.0
     all_frames.append(ev.render())
     for _ in range(200):
-        a = agent.act_plan_continuous(s, horizon=cfg.planner.horizon,
-                                      plan_iters=cfg.planner.plan_iters,
-                                      action_scale=cfg.env.action_scale)
+        a = agent.act_policy_continuous_batch(
+            s[np.newaxis], action_scale=cfg.env.action_scale)[0]
         s, r, term, trunc, _ = ev.step(a)
         all_frames.append(ev.render())
         ret += r
@@ -261,8 +263,9 @@ def _colorline(ax, x, y, cmap="plasma", lw=2.0):
 # Live dashboard (2×3): training metrics + state-space panels
 # ---------------------------------------------------------------------------
 
-def _save_live_plot(episode_returns, koop_log, v_log, step, ortho_err,
-                    agent=None, buf=None, path="pendulum_toeplitz_live.png"):
+def _save_live_plot(episode_returns, koop_log, q_log=None, step=0, ortho_err=0.0,
+                    agent=None, buf=None, path="pendulum_toeplitz_live.png",
+                    **_kw):  # absorb any extra kwargs from old callers
     """
     2×3 live dashboard saved to a fixed path every viz_every steps.
     Called via the on_viz callback from train_continuous.
@@ -289,8 +292,8 @@ def _save_live_plot(episode_returns, koop_log, v_log, step, ortho_err,
     ax = axes[0, 1]
     if koop_log:
         ax.semilogy(koop_log, color="#e377c2", lw=1.5, label="L_koop")
-    if v_log:
-        ax.semilogy(v_log,    color="#17becf", lw=1.5, label="L_v")
+    if q_log:
+        ax.semilogy(q_log,    color="#17becf", lw=1.5, label="L_q")
     ax.set_title("Training Losses"); ax.set_xlabel("Log step (×1k)")
     ax.legend(fontsize=8); ax.grid(alpha=0.3)
 
@@ -515,20 +518,29 @@ def plot_final_summary(agent, episode_returns, buf, cfg=None):
             u   = torch.tanh(u_logits)
             for t in range(VIZ_PLAN_HORIZON):
                 z_t = agent.dyn_step(z_t, (agent.B @ u[t]).unsqueeze(0))
-            loss = -agent.v_net(z_t).mean()
+            if hasattr(agent, 'q_net') and hasattr(agent, 'pi_net'):
+                a_t  = agent.pi_net(z_t)
+                loss = -agent.q_net(torch.cat([z_t, a_t], -1)).mean()
+            else:
+                loss = -agent.v_net(z_t).mean()
             (g,) = torch.autograd.grad(loss, u_logits, only_inputs=True)
             u_logits.grad = g
             opt_tmp.step()
         with torch.no_grad():
             u_opt = torch.tanh(u_logits)
             z_t   = z0
-            v_traj = [agent.v_net(z_t).item()]
+            def _val(z):
+                if hasattr(agent, 'q_net') and hasattr(agent, 'pi_net'):
+                    a = agent.pi_net(z)
+                    return agent.q_net(torch.cat([z, a], -1)).item()
+                return agent.v_net(z).item()
+            v_traj = [_val(z_t)]
             for t in range(VIZ_PLAN_HORIZON):
                 z_t = agent.dyn_step(z_t, (agent.B @ u_opt[t]).unsqueeze(0))
-                v_traj.append(agent.v_net(z_t).item())
+                v_traj.append(_val(z_t))
         ax.plot(v_traj, "o-", color="#9467bd", lw=2, ms=5)
         ax.set_xlabel("Plan step")
-        ax.set_ylabel("V_ψ(z_t)")
+        ax.set_ylabel("Q(z_t, π(z_t))" if hasattr(agent, 'q_net') else "V_ψ(z_t)")
         ax.set_title("Value Along Planned Trajectory")
     except Exception as e:
         ax.text(0.5, 0.5, str(e), ha="center", va="center", transform=ax.transAxes)
@@ -553,8 +565,6 @@ def _default_pendulum_cfg():
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--cumulative", action="store_true",
-                        help="Use cumulative value objective during training")
     parser.add_argument("--sequential", action="store_true",
                         help="Use sequential planner for data collection (default: Toeplitz GEMM)")
     parser.add_argument("--frozen_b", action="store_true",

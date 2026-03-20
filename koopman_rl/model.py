@@ -152,14 +152,28 @@ class KoopmanGradientPlanner(nn.Module):
     """
     def __init__(self, state_dim: int = STATE_DIM, d: int = D,
                  n_actions: int = N_ACTIONS, ortho_a: bool = False,
-                 tanh_out: bool = False, device=None):
+                 tanh_out: bool = False, device=None, continuous: bool = False):
         super().__init__()
-        self.d         = d
-        self.n_actions = n_actions
-        self._ortho_a  = ortho_a
-        self.encoder   = Encoder(state_dim, d, tanh_out=tanh_out)
-        self.v_net     = ValueNetwork(d)
-        self.decoder   = nn.Linear(d, state_dim)
+        self.d          = d
+        self.n_actions  = n_actions
+        self._ortho_a   = ortho_a
+        self._continuous = continuous
+        self.encoder    = Encoder(state_dim, d, tanh_out=tanh_out)
+        self.decoder    = nn.Linear(d, state_dim)
+
+        if continuous:
+            # Continuous actor-critic heads.
+            # r_net: R(z, a_norm) → scalar  (direct regression, no bootstrap)
+            # q_net: Q(z, a_norm) → scalar  (Bellman TD with target network)
+            # pi_net: π(z) → a_norm ∈ [-1,1]^action_dim  (DDPG-style)
+            self.r_net  = nn.Sequential(
+                nn.Linear(d + n_actions, 64), nn.ReLU(), nn.Linear(64, 1))
+            self.q_net  = nn.Sequential(
+                nn.Linear(d + n_actions, 64), nn.ReLU(), nn.Linear(64, 1))
+            self.pi_net = nn.Sequential(
+                nn.Linear(d, 64), nn.ReLU(), nn.Linear(64, n_actions), nn.Tanh())
+        else:
+            self.v_net = ValueNetwork(d)
 
         # CUDA: SVD Procrustes hard constraint (covers full O(d), det=±1).
         # MPS/CPU: unconstrained A + soft penalty in loss (no linalg.svd round-trip).
@@ -239,6 +253,7 @@ class KoopmanGradientPlanner(nn.Module):
             ortho_a=cfg.model.ortho_a,
             tanh_out=cfg.model.tanh_out,
             device=device,
+            continuous=cfg.env.continuous,
         )
 
     def encode(self, state: torch.Tensor) -> torch.Tensor:
@@ -246,6 +261,14 @@ class KoopmanGradientPlanner(nn.Module):
 
     def value(self, state: torch.Tensor) -> torch.Tensor:
         return self.v_net(self.encoder(state))
+
+    @torch.no_grad()
+    def act_policy_continuous_batch(self, states: np.ndarray,
+                                    action_scale: float = 1.0) -> np.ndarray:
+        """Direct policy rollout for N states. Returns [N, action_dim] in [-action_scale, action_scale]."""
+        device = next(self.parameters()).device
+        z = self.encoder(torch.tensor(states, dtype=torch.float32, device=device))
+        return (self.pi_net(z) * action_scale).cpu().numpy()
 
     def transition(self, z: torch.Tensor, a: torch.Tensor) -> torch.Tensor:
         """z' = A z + B a  (unnormalised — for L_koop loss)."""
@@ -299,25 +322,21 @@ class KoopmanGradientPlanner(nn.Module):
 
     def act_plan_toeplitz_continuous(self, state: np.ndarray,
                                      horizon: int = 10, plan_iters: int = 20,
-                                     gamma: float = 0.95, action_scale: float = 1.0,
-                                     cumulative: bool = True) -> np.ndarray:
+                                     gamma: float = 0.95, action_scale: float = 1.0) -> np.ndarray:
         """Block-Toeplitz GEMM MPC — continuous environments, requires ortho_a=True.
-        cumulative=False uses terminal V only (stable for data collection);
-        cumulative=True uses discounted sum over horizon (better at eval)."""
+        Uses discounted r_net path costs + Q(z_H, π(z_H)) terminal."""
         return plan_action_toeplitz_continuous_batch(
             self, state[np.newaxis], horizon, plan_iters,
-            gamma=gamma, action_scale=action_scale, cumulative=cumulative,
+            gamma=gamma, action_scale=action_scale,
         )[0]
 
     def act_plan_toeplitz_continuous_batch(self, states: np.ndarray,
                                            horizon: int = 10, plan_iters: int = 20,
-                                           gamma: float = 0.95, action_scale: float = 1.0,
-                                           cumulative: bool = True) -> np.ndarray:
+                                           gamma: float = 0.95, action_scale: float = 1.0) -> np.ndarray:
         """Batched Block-Toeplitz GEMM MPC for N states. W_toeplitz built once.
         Returns [N, action_dim]. Requires ortho_a=True."""
         return plan_action_toeplitz_continuous_batch(self, states, horizon, plan_iters,
-                                                     gamma=gamma, action_scale=action_scale,
-                                                     cumulative=cumulative)
+                                                     gamma=gamma, action_scale=action_scale)
 
     def act_plan_continuous_batch(self, states: np.ndarray,
                                   horizon: int = 10, plan_iters: int = 20,
@@ -334,22 +353,34 @@ KoopmanAgent = KoopmanGradientPlanner
 
 class TargetNetwork:
     """
-    EMA copy of encoder + V-net.  Not an nn.Module — excluded from optimizer
-    parameters automatically.  A and B are NOT tracked: bootstrap value
-    V_target(s') = V_ψ_target(enc_target(s')) doesn't require the dynamics model.
+    EMA copies of encoder + value/critic heads.  Not an nn.Module — excluded
+    from optimizer parameters automatically.  A and B are NOT tracked.
+
+    Discrete path: copies v_net.
+    Continuous path: copies q_net and pi_net (r_net is direct regression — no target needed).
     """
     def __init__(self, agent: KoopmanGradientPlanner):
         self.encoder = copy.deepcopy(agent.encoder).eval()
-        self.v_net   = copy.deepcopy(agent.v_net).eval()
-        for p in self.encoder.parameters(): p.requires_grad_(False)
-        for p in self.v_net.parameters():   p.requires_grad_(False)
+        for name in ['v_net', 'q_net', 'pi_net']:
+            if hasattr(agent, name):
+                setattr(self, name, copy.deepcopy(getattr(agent, name)).eval())
+        # Freeze all target params
+        for p in self.encoder.parameters():
+            p.requires_grad_(False)
+        for name in ['v_net', 'q_net', 'pi_net']:
+            if hasattr(self, name):
+                for p in getattr(self, name).parameters():
+                    p.requires_grad_(False)
 
     @torch.no_grad()
     def update(self, agent: KoopmanGradientPlanner, tau: float = EMA_TAU) -> None:
         for p_t, p_o in zip(self.encoder.parameters(), agent.encoder.parameters()):
             p_t.data.mul_(1 - tau).add_(p_o.data, alpha=tau)
-        for p_t, p_o in zip(self.v_net.parameters(), agent.v_net.parameters()):
-            p_t.data.mul_(1 - tau).add_(p_o.data, alpha=tau)
+        for name in ['v_net', 'q_net', 'pi_net']:
+            if hasattr(self, name):
+                for p_t, p_o in zip(getattr(self, name).parameters(),
+                                    getattr(agent, name).parameters()):
+                    p_t.data.mul_(1 - tau).add_(p_o.data, alpha=tau)
 
     @torch.no_grad()
     def v_target(self, states: torch.Tensor) -> torch.Tensor:
