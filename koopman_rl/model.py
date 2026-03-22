@@ -354,8 +354,9 @@ class KoopmanGradientPlanner(nn.Module):
             # Single batched GEMM replaces N × H sequential dyn_step calls
             Z = ZIR + (X_flat @ W_toeplitz.T).reshape(N, horizon, d)  # [N, H, d]
 
-            # Explicit path rewards from r_net
-            ZU           = torch.cat([Z, u], dim=-1)                   # [N, H, d+action_dim]
+            # Explicit path rewards from r_net — pair current states z_0..z_{H-1} with actions
+            Z_curr       = torch.cat([z0.unsqueeze(1), Z[:, :-1, :]], dim=1)  # [N, H, d]
+            ZU           = torch.cat([Z_curr, u], dim=-1)              # [N, H, d+action_dim]
             path_rewards = agent.r_net(ZU).squeeze(-1)                 # [N, H]
             disc_path    = (gammas_path.unsqueeze(0) * path_rewards).sum(dim=1)  # [N]
 

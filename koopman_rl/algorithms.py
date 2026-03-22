@@ -21,7 +21,7 @@ from koopman_rl.env import GravityBasin
 from koopman_rl.model import KoopmanGradientPlanner, TargetNetwork
 from koopman_rl.buffer import ReplayBuffer
 from koopman_rl.planner import (
-    plan_action_gumbel, plan_action_shooting, plan_action_beam, plan_action_continuous
+    plan_action_gumbel, plan_action_shooting, plan_action_beam
 )
 
 
@@ -464,7 +464,6 @@ def evaluate_planner(agent, cfg=None, n_episodes: int = 100,
         "gumbel_cumul": [],
         "shooting_200": [],
         "beam_8":       [],
-        "toeplitz":     [],
     }
 
     for mode, act_fn in [
@@ -473,7 +472,6 @@ def evaluate_planner(agent, cfg=None, n_episodes: int = 100,
         ("gumbel_cumul", lambda s: plan_action_gumbel(agent, s, horizon, plan_iters, cumulative=True)),
         ("shooting_200", lambda s: plan_action_shooting(agent, s, horizon, n_samples=200)),
         ("beam_8",       lambda s: plan_action_beam(agent, s, horizon, beam_width=8)),
-        ("toeplitz",     lambda s: plan_action_continuous(agent, s, horizon, plan_iters)),
     ]:
         print(f"\n  [{mode}] evaluating {n_episodes} episodes...", flush=True)
         for _ in range(n_episodes):

@@ -37,8 +37,8 @@ from koopman_rl.trainer_continuous import train_continuous
 # ---------------------------------------------------------------------------
 ACTION_DIM       = 1
 ACTION_SCALE     = 2.0
-PLAN_HORIZON     = 20
-PLAN_ITERS       = 50
+PLAN_HORIZON     = 2
+PLAN_ITERS       = 10
 VIZ_PLAN_HORIZON = 20   # longer horizon for viz plan rollouts (offline)
 VIZ_PLAN_ITERS   = 50   # more iters for viz (no speed pressure)
 VIZ_DIR          = "output/viz/pendulum"
@@ -551,6 +551,247 @@ def plot_final_summary(agent, episode_returns, buf, cfg=None):
     print(f"  [viz] {path}")
 
 
+def plot_plan_evolution(agent, cfg, capture_at=None):
+    """
+    Show how the Toeplitz plan (decoded latent trajectory + action sequence) evolves
+    over Adam iterations for a set of diverse starting states.
+
+    Layout: 2 rows per starting state (top = phase trajectory, bottom = action bars),
+    one column per captured iteration snapshot.
+    """
+    agent.eval()
+    device     = next(agent.parameters()).device
+    horizon    = cfg.planner.horizon
+    plan_iters = cfg.planner.plan_iters
+    gamma      = cfg.algo.gamma
+    action_scale = cfg.env.action_scale
+    d          = agent.d
+    action_dim = agent.B.shape[1]
+
+    if capture_at is None:
+        capture_at = sorted({0, max(1, plan_iters // 4), plan_iters // 2,
+                             max(1, 3 * plan_iters // 4), plan_iters})
+
+    starts = [
+        ("hanging\nω=0",    np.array([-1.0,  0.0,  0.0], np.float32)),
+        ("side\nω=+3",      np.array([ 0.0,  1.0,  3.0], np.float32)),
+        ("side\nω=−3",      np.array([ 0.0, -1.0, -3.0], np.float32)),
+    ]
+    n_snaps = len(capture_at)
+    n_starts = len(starts)
+
+    fig, axes = plt.subplots(
+        n_starts * 2, n_snaps,
+        figsize=(2.6 * n_snaps, 3.2 * n_starts),
+        squeeze=False,
+    )
+    fig.suptitle(
+        f"Toeplitz Plan Evolution  (H={horizon}  plan_iters={plan_iters}  γ={gamma})",
+        fontsize=11,
+    )
+
+    with torch.no_grad():
+        B = agent.B.detach()
+        W_toeplitz, _, A_stack = agent.get_toeplitz_cache(horizon, gamma)
+
+    gammas_path = gamma ** torch.arange(horizon, device=device, dtype=torch.float32)
+    h_ax        = np.arange(horizon)
+
+    for s_idx, (label, s0) in enumerate(starts):
+        row_traj = s_idx * 2
+        row_act  = s_idx * 2 + 1
+
+        with torch.no_grad():
+            z0  = agent.encoder(
+                torch.tensor(s0[np.newaxis], dtype=torch.float32, device=device)
+            )
+            ZIR = torch.einsum('kij,nj->nki', A_stack[1:], z0)   # [1, H, d]
+
+        u_logits = torch.zeros(1, horizon, action_dim, device=device, requires_grad=True)
+        opt      = optim.Adam([u_logits], lr=0.1)
+
+        snap_col = 0
+        for it in range(plan_iters + 1):
+            if it in capture_at:
+                with torch.no_grad():
+                    u      = torch.tanh(u_logits)
+                    X_flat = (u @ B.T).reshape(1, horizon * d)
+                    Z      = ZIR + (X_flat @ W_toeplitz.T).reshape(1, horizon, d)
+                    all_z  = torch.cat([z0.unsqueeze(1), Z], dim=1).squeeze(0)  # [H+1, d]
+                    dec    = agent.decoder(all_z).cpu().numpy()
+                    thetas    = np.arctan2(dec[:, 1], dec[:, 0])
+                    thetadots = dec[:, 2]
+                    actions   = (u[0, :, 0] * action_scale).cpu().numpy()
+
+                # ── phase trajectory ───────────────────────────────────────
+                ax = axes[row_traj, snap_col]
+                ax.plot(thetas, thetadots, 'o-', lw=1.5, ms=3, color='#4c8bc9')
+                ax.plot(thetas[0],  thetadots[0],  'go', ms=7, zorder=5)
+                ax.plot(thetas[-1], thetadots[-1], 'r*', ms=9, zorder=5)
+                ax.axvline(0, color='gray', lw=0.6, alpha=0.5)
+                ax.set_xlim(-np.pi, np.pi)
+                ax.set_ylim(-8, 8)
+                ax.set_xticks([-np.pi, 0, np.pi])
+                ax.set_xticklabels(['-π', '0', 'π'], fontsize=7)
+                ax.tick_params(labelsize=7)
+                if snap_col == 0:
+                    ax.set_ylabel(f"{label}\nθ̇", fontsize=8)
+                if s_idx == 0:
+                    ax.set_title(f"iter {it}", fontsize=9)
+
+                # ── action bars ────────────────────────────────────────────
+                ax = axes[row_act, snap_col]
+                bar_colors = ['#e377c2' if a >= 0 else '#17becf' for a in actions]
+                ax.bar(h_ax, actions, color=bar_colors, alpha=0.85, width=0.7)
+                ax.axhline(0, color='black', lw=0.6)
+                ax.set_ylim(-action_scale * 1.15, action_scale * 1.15)
+                ax.set_xlim(-0.5, horizon - 0.5)
+                ax.set_xticks(h_ax)
+                ax.tick_params(labelsize=7)
+                if snap_col == 0:
+                    ax.set_ylabel("torque", fontsize=8)
+                ax.set_xlabel("step", fontsize=7)
+
+                snap_col += 1
+
+            if it < plan_iters:
+                opt.zero_grad()
+                u      = torch.tanh(u_logits)
+                X_flat = (u @ B.T).reshape(1, horizon * d)
+                Z      = ZIR + (X_flat @ W_toeplitz.T).reshape(1, horizon, d)
+                ZU     = torch.cat([Z, u], dim=-1)
+                disc_path = (gammas_path * agent.r_net(ZU).squeeze(-1)).sum(dim=1)
+                z_H   = Z[:, -1, :]
+                a_H   = agent.pi_net(z_H)
+                q_H   = agent.q_net(torch.cat([z_H, a_H], -1)).squeeze(-1)
+                loss  = -(disc_path + gamma ** horizon * q_H).mean()
+                (grad_u,) = torch.autograd.grad(loss, u_logits, only_inputs=True)
+                u_logits.grad = grad_u
+                opt.step()
+
+    plt.tight_layout()
+    path = os.path.join(VIZ_DIR, "plan_evolution.png")
+    fig.savefig(path, dpi=110, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  [viz] {path}")
+
+
+def plot_policy_vs_planner(agent, cfg, max_steps=200):
+    """
+    Run real Pendulum-v1 episodes from diverse starting positions using:
+      - direct policy  (π only)
+      - Toeplitz MPC   (r_net path + Q terminal)
+    Plot phase-portrait trajectories side by side, plus a return bar chart.
+    """
+    agent.eval()
+    plan_horizon = cfg.planner.horizon
+    plan_iters   = cfg.planner.plan_iters
+    gamma        = cfg.algo.gamma
+    action_scale = cfg.env.action_scale
+
+    starts = [
+        ("hanging ω=0",   np.array([-1.0,  0.0,  0.0],                    np.float32)),
+        ("hanging ω=+2",  np.array([-1.0,  0.0,  2.0],                    np.float32)),
+        ("hanging ω=−2",  np.array([-1.0,  0.0, -2.0],                    np.float32)),
+        ("side ω=0",      np.array([ 0.0,  1.0,  0.0],                    np.float32)),
+        ("near top ω=0",  np.array([np.cos(0.4), np.sin(0.4),  0.0],      np.float32)),
+        ("near top ω=+2", np.array([np.cos(0.4), np.sin(0.4),  2.0],      np.float32)),
+    ]
+    colors = ['#e377c2', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#17becf']
+
+    def _run_from(s0, action_fn):
+        ev = gym.make("Pendulum-v1")
+        ev.reset()
+        theta = np.arctan2(float(s0[1]), float(s0[0]))
+        ev.unwrapped.state = np.array([theta, float(s0[2])])
+        s = s0.copy()
+        states, ret = [s.copy()], 0.0
+        for _ in range(max_steps):
+            a = action_fn(s)
+            s, r, term, trunc, _ = ev.step(np.atleast_1d(a).astype(np.float32))
+            states.append(s.copy())
+            ret += r
+            if term or trunc:
+                break
+        ev.close()
+        return np.array(states, dtype=np.float32), ret
+
+    try:
+        _vg = _value_grid(agent)
+    except Exception:
+        _vg = None
+
+    fig, (ax_pol, ax_plan, ax_ret) = plt.subplots(1, 3, figsize=(18, 7))
+    fig.suptitle(
+        f"Direct Policy vs Toeplitz MPC — Real Env Trajectories  "
+        f"(H={plan_horizon}  iters={plan_iters})",
+        fontsize=12,
+    )
+
+    for ax, title in [(ax_pol, "Direct Policy"), (ax_plan, f"Toeplitz MPC")]:
+        if _vg is not None:
+            _, _, V_grid = _vg
+            ax.imshow(V_grid, extent=[-np.pi, np.pi, -8, 8],
+                      aspect="auto", origin="lower", cmap="viridis", alpha=0.35)
+        ax.axvline(0, color="white", lw=0.8, alpha=0.6)
+        ax.set_xlim(-np.pi, np.pi)
+        ax.set_ylim(-8, 8)
+        ax.set_xticks([-np.pi, -np.pi / 2, 0, np.pi / 2, np.pi])
+        ax.set_xticklabels(["-π", "-π/2", "0", "π/2", "π"])
+        ax.set_xlabel("θ (rad)")
+        ax.set_ylabel("θ̇ (rad/s)")
+        ax.set_title(title)
+
+    pol_rets, plan_rets = [], []
+
+    for (label, s0), col in zip(starts, colors):
+        # ── policy episode ───────────────────────────────────────────────────
+        pol_states, pol_ret = _run_from(
+            s0, lambda s: agent.act_policy_continuous_batch(
+                s[np.newaxis], action_scale)[0])
+        th, td = _to_theta_thetadot(pol_states)
+        ax_pol.plot(th, td, color=col, lw=1.6, alpha=0.85)
+        ax_pol.plot(th[0],  td[0],  "o", color=col, ms=8, zorder=5)
+        ax_pol.plot(th[-1], td[-1], "*", color=col, ms=10, zorder=5,
+                    label=f"{label}  {pol_ret:.0f}")
+
+        # ── planner episode ──────────────────────────────────────────────────
+        plan_states, plan_ret = _run_from(
+            s0, lambda s: agent.act_plan_continuous(
+                s[np.newaxis], plan_horizon, plan_iters,
+                gamma=gamma, action_scale=action_scale)[0])
+        th, td = _to_theta_thetadot(plan_states)
+        ax_plan.plot(th, td, color=col, lw=1.6, alpha=0.85)
+        ax_plan.plot(th[0],  td[0],  "o", color=col, ms=8, zorder=5)
+        ax_plan.plot(th[-1], td[-1], "*", color=col, ms=10, zorder=5,
+                     label=f"{label}  {plan_ret:.0f}")
+
+        pol_rets.append(pol_ret)
+        plan_rets.append(plan_ret)
+
+    ax_pol.legend(fontsize=7, loc="upper right")
+    ax_plan.legend(fontsize=7, loc="upper right")
+
+    # ── return bar chart ──────────────────────────────────────────────────────
+    x = np.arange(len(starts))
+    w = 0.35
+    ax_ret.bar(x - w / 2, pol_rets,  w, label="Policy",       color="#4c8bc9", alpha=0.85)
+    ax_ret.bar(x + w / 2, plan_rets, w, label="Toeplitz MPC", color="#ff7f0e", alpha=0.85)
+    ax_ret.axhline(-300, color="green", ls="--", lw=1.2, label="−300 target")
+    ax_ret.set_xticks(x)
+    ax_ret.set_xticklabels([l for l, _ in starts], rotation=20, ha="right", fontsize=8)
+    ax_ret.set_ylabel("Episode Return")
+    ax_ret.set_title("Return by Starting Position")
+    ax_ret.legend(fontsize=9)
+    ax_ret.grid(alpha=0.3)
+
+    plt.tight_layout()
+    path = os.path.join(VIZ_DIR, "policy_vs_planner.png")
+    fig.savefig(path, dpi=110, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  [viz] {path}")
+
+
 def _default_pendulum_cfg():
     """Minimal cfg for standalone use of viz functions (e.g., loading a checkpoint)."""
     return Config(
@@ -588,4 +829,7 @@ if __name__ == "__main__":
         cfg, "Pendulum-v1", device,
         on_viz=lambda **kw: _save_live_plot(**kw, path=live_png),
     )
-    plot_final_summary(result["agent"], result["episode_returns"], result["buf"], cfg=cfg)
+    agent = result["agent"]
+    plot_final_summary(agent, result["episode_returns"], result["buf"], cfg=cfg)
+    plot_plan_evolution(agent, cfg)
+    plot_policy_vs_planner(agent, cfg)

@@ -185,12 +185,13 @@ def train_continuous(
                 for k in ("states", "next_s", "actions", "rewards", "dones", "terminals")
             )
 
-            z_src = agent.encode(s_b)
+            z_src  = agent.encode(s_b)
+            a_norm = a_b / action_scale           # normalise to [-1, 1]; consistent with planner
             with torch.no_grad():
                 z_dst_tgt = target.encoder(ns_b)
 
             # ── Koopman + reconstruction (gradient flows to encoder/A/B/decoder) ─
-            z_pred  = agent.dyn_step(z_src, a_b @ agent.B.T)
+            z_pred  = agent.dyn_step(z_src, a_norm @ agent.B.T)   # B trained in normalised units
             L_koop  = ((z_pred - z_dst_tgt.detach()).pow(2)
                        .sum(dim=-1) * (1.0 - d_b)).mean()
             L_recon = (agent.decoder(z_src) - s_b).pow(2).mean()
@@ -205,7 +206,6 @@ def train_continuous(
             z_dst_det = z_dst_tgt                # target encoder already has no grad
 
             # ── Reward predictor (no bootstrap, no target needed) ─────────────
-            a_norm = a_b / action_scale           # normalise to [-1, 1]
             za     = torch.cat([z_det, a_norm], dim=-1)
             L_r    = (agent.r_net(za).squeeze(-1) - r_b / reward_scale).pow(2).mean()
 
@@ -270,6 +270,17 @@ def train_continuous(
 
     env.close()
 
+    # ── Restore best checkpoint for benchmark ────────────────────────────────
+    if os.path.exists(best_ckpt):
+        ckpt = torch.load(best_ckpt, map_location=device, weights_only=False)
+        agent.load_state_dict(ckpt["agent_state_dict"])
+        target.encoder.load_state_dict(ckpt["target_encoder"])
+        if "target_q_net" in ckpt:
+            target.q_net.load_state_dict(ckpt["target_q_net"])
+            target.pi_net.load_state_dict(ckpt["target_pi_net"])
+        agent.eval()
+        print(f"\n  [benchmark] restored best checkpoint (ret/20={best_ret:.1f}): {best_ckpt}")
+
     # ── Planner benchmark ─────────────────────────────────────────────────────
     print("\n" + "=" * 64)
     print(f"  Planner benchmark — {_N_EVAL_PLAN} episodes each")
@@ -281,7 +292,7 @@ def train_continuous(
         ("direct policy         ",
          lambda ss: agent.act_policy_continuous_batch(ss, action_scale)),
         ("toeplitz MPC (r_net+Q)",
-         lambda ss: agent.act_plan_toeplitz_continuous_batch(
+         lambda ss: agent.act_plan_continuous(
              ss, plan_horizon, plan_iters, gamma=gamma, action_scale=action_scale)),
     ]
     for name, fn in planners:
