@@ -991,11 +991,10 @@ def _plan_objectives(agent, z0, z_goal, horizon, plan_iters, gamma):
 def _value_free_grad_act_batch(agent, states: np.ndarray, z_goal,
                     horizon, plan_iters, gamma, action_scale) -> np.ndarray:
     """
-    Gradient-descent value-free planner: min_u ‖z_H − z_goal‖²
+    Gradient-descent planner: min_u ‖z_H − z_goal‖² − Σ_t γ^t R_φ(z_t, u_t)
 
-    Same objective as the closed-form version, but solved with Adam on
-    tanh-squashed logits.  The tanh provides a soft action bound during
-    optimisation (unlike the closed-form which solves unbounded then clamps).
+    Combines the terminal latent-distance objective with a discounted reward sum
+    from the learned R_φ.  Solved with Adam on tanh-squashed logits (soft bound).
 
     Returns actions [N, action_dim] ∈ [-action_scale, action_scale].
     """
@@ -1009,6 +1008,7 @@ def _value_free_grad_act_batch(agent, states: np.ndarray, z_goal,
         B = agent.B.detach()
         W_toeplitz, _, A_stack = agent.get_toeplitz_cache(horizon, gamma)
         ZIR = torch.einsum('kij,nj->nki', A_stack[1:], z0)  # [N, H, d]
+        gammas_path = gamma ** torch.arange(horizon, device=device, dtype=torch.float32)  # [H]
 
     u_logits = torch.zeros(N, horizon, action_dim, device=device, requires_grad=True)
     opt = torch.optim.Adam([u_logits], lr=0.1)
@@ -1019,7 +1019,14 @@ def _value_free_grad_act_batch(agent, states: np.ndarray, z_goal,
         X_flat = (u @ B.T).reshape(N, horizon * d)
         Z = ZIR + (X_flat @ W_toeplitz.T).reshape(N, horizon, d)
         z_H = Z[:, -1, :]
-        loss = ((z_H - z_goal.detach()) ** 2).sum(dim=-1).mean()
+
+        # discounted reward sum: R_φ(z_t, u_t) for t = 0..H-1
+        Z_curr    = torch.cat([z0.unsqueeze(1), Z[:, :-1, :]], dim=1)  # state before each action [N, H, d]
+        ZU        = torch.cat([Z_curr, u], dim=-1)                      # [N, H, d+action_dim]
+        disc_path = (gammas_path * agent.r_net(ZU).squeeze(-1)).sum(dim=1)  # [N]
+
+        goal_loss = ((z_H - z_goal.detach()) ** 2).sum(dim=-1)  # [N]
+        loss = (goal_loss - disc_path).mean()
         (grad_u,) = torch.autograd.grad(loss, u_logits, only_inputs=True)
         u_logits.grad = grad_u
         opt.step()
