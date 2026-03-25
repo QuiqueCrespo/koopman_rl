@@ -30,18 +30,22 @@ def train_continuous(
     env_id: str,
     device: torch.device,
     on_viz=None,
+    extra_eval_fns=None,
 ) -> dict:
     """
     Train KoopmanGradientPlanner on a continuous-action gymnasium environment.
 
     Parameters
     ----------
-    cfg     : Config with all hyperparameters (see config.py).
-    env_id  : gymnasium env id, e.g. "Pendulum-v1".
-    device  : torch device to train on.
-    on_viz  : optional callable invoked every cfg.train.viz_every steps.
-              Called with keyword args:
-                episode_returns, koop_log, q_log, step, ortho_err, agent, buf
+    cfg            : Config with all hyperparameters (see config.py).
+    env_id         : gymnasium env id, e.g. "Pendulum-v1".
+    device         : torch device to train on.
+    on_viz         : optional callable invoked every cfg.train.viz_every steps.
+                     Called with keyword args:
+                       episode_returns, koop_log, q_log, step, ortho_err, agent, buf
+    extra_eval_fns : optional list of (name, fn_factory) pairs added to the
+                     end-of-training benchmark.  fn_factory(agent) must return a
+                     batched action fn  ss → actions[N, action_dim].
 
     Returns
     -------
@@ -130,24 +134,23 @@ def train_continuous(
     ep_returns      = np.zeros(n_envs, dtype=np.float32)
     episode_returns = []
     koop_log, q_log = [], []
-    recent_koop, recent_q, recent_r, recent_pi = [], [], [], []
+    recent_koop, recent_q, recent_r, recent_pi, recent_recon = [], [], [], [], []
     ou_list  = [OUNoise(action_dim) for _ in range(n_envs)] if ou_noise else None
-    best_ret = -float("inf")
-    t0       = time.time()
+    best_koop = float("inf")
+    t0        = time.time()
 
     for env_step in range(n_envs, n_steps + 1, n_envs):
         noise = max(noise_end,
                     noise_start - (noise_start - noise_end)
                     * max(0, env_step - warmup) / noise_decay)
 
-        # Data collection: random during warmup, policy + noise afterwards
+        # Data collection: random during warmup, policy + noise afterwards.
+        # MPC is eval-only — using the planner here costs ~200x per step.
         if env_step <= warmup:
             actions = np.random.uniform(-action_scale, action_scale,
                                         (n_envs, action_dim)).astype(np.float32)
         else:
-            # actions = agent.act_policy_continuous_batch(states, action_scale)
-            actions = agent.act_plan_continuous(
-                states, plan_horizon, plan_iters, gamma=gamma, action_scale=action_scale)
+            actions = agent.act_policy_continuous_batch(states, action_scale)
             if ou_noise:
                 exploration = np.stack([ou_list[i].sample(sigma=noise * action_scale)
                                         for i in range(n_envs)])
@@ -241,28 +244,30 @@ def train_continuous(
         recent_q.append(L_q.item())
         recent_r.append(L_r.item())
         recent_pi.append(L_pi.item())
+        recent_recon.append(L_recon.item())
 
         if env_step % 1_000 == 0:
             elapsed = time.time() - t0; t0 = time.time()
-            mk  = np.mean(recent_koop)
-            mq  = np.mean(recent_q)
-            mr  = np.mean(recent_r)
-            mpi = np.mean(recent_pi)
+            mk     = np.mean(recent_koop)
+            mq     = np.mean(recent_q)
+            mr     = np.mean(recent_r)
+            mpi    = np.mean(recent_pi)
+            mrecon = np.mean(recent_recon)
             koop_log.append(mk); q_log.append(mq)
             recent20 = episode_returns[-20:] if episode_returns else []
             ret20    = np.mean(recent20) if recent20 else float("nan")
             ortho_err = agent.ortho_error()
             print(f"  step {env_step:5d}  noise={noise:.3f}"
-                  f"  L_koop={mk:.4f}  L_r={mr:.4f}  L_q={mq:.4f}  L_pi={mpi:.4f}"
+                  f"  L_koop={mk:.4f}  L_recon={mrecon:.4f}  L_r={mr:.4f}  L_q={mq:.4f}  L_pi={mpi:.4f}"
                   f"  ret/20={ret20:7.1f}"
                   f"  ‖AᵀA-I‖²={ortho_err:.1e}  sps={1000/elapsed:.0f}", flush=True)
-            recent_koop.clear(); recent_q.clear(); recent_r.clear(); recent_pi.clear()
+            recent_koop.clear(); recent_q.clear(); recent_r.clear(); recent_pi.clear(); recent_recon.clear()
 
-            if ret20 > best_ret:
-                best_ret = ret20
-                _history = _make_history(cfg, episode_returns, koop_log, q_log, best_ret)
+            if mk < best_koop and env_step > warmup:
+                best_koop = mk
+                _history = _make_history(cfg, episode_returns, koop_log, q_log, ret20)
                 save_checkpoint_async(agent, target, _history, path=best_ckpt)
-                print(f"  [best] ret/20={best_ret:.1f} → {best_ckpt}", flush=True)
+                print(f"  [best koop] L_koop={best_koop:.4f}  ret/20={ret20:.1f} → {best_ckpt}", flush=True)
 
         if env_step % viz_every == 0 and on_viz is not None:
             on_viz(episode_returns=episode_returns, koop_log=koop_log, q_log=q_log,
@@ -279,7 +284,7 @@ def train_continuous(
             target.q_net.load_state_dict(ckpt["target_q_net"])
             target.pi_net.load_state_dict(ckpt["target_pi_net"])
         agent.eval()
-        print(f"\n  [benchmark] restored best checkpoint (ret/20={best_ret:.1f}): {best_ckpt}")
+        print(f"\n  [benchmark] restored best checkpoint (L_koop={best_koop:.4f}): {best_ckpt}")
 
     # ── Planner benchmark ─────────────────────────────────────────────────────
     print("\n" + "=" * 64)
@@ -295,8 +300,13 @@ def train_continuous(
          lambda ss: agent.act_plan_continuous(
              ss, plan_horizon, plan_iters, gamma=gamma, action_scale=action_scale)),
     ]
+    if extra_eval_fns:
+        for name, fn_factory in extra_eval_fns:
+            planners.append((name, fn_factory(agent)))
     for name, fn in planners:
         t_plan = time.time()
+        if hasattr(fn, "reset"):
+            fn.reset()   # discard any stale warm-start state before the episode
         ss, _ = eval_env.reset()
         ep_rets = np.zeros(_N_EVAL_PLAN, dtype=np.float32)
         for _ in range(200):

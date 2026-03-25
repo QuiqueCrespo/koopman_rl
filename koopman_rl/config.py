@@ -71,6 +71,11 @@ class PlannerConfig:
     tau:        float = 1.0    # Gumbel temperature (lower → more discrete / sharper)
     n_samples:  int   = 200    # random shooting
     beam_width: int   = 8      # beam search
+    # CEM-Gradient hybrid (plan_cem_gradient_batch)
+    cem_iters:      int = 20    # CEM refitting rounds
+    cem_samples:    int = 1000  # trajectories sampled per CEM round
+    cem_elites:     int = 30   # top-K kept for Gaussian refit
+    cem_grad_iters: int = 20   # Adam steps after CEM warm-start
 
 
 @dataclass

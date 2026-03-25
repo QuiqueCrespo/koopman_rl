@@ -304,12 +304,15 @@ class KoopmanGradientPlanner(nn.Module):
 
     def act_plan_continuous(
         agent,
-        states:       np.ndarray,
-        horizon:      int   = 10,
-        plan_iters:   int   = 20,
-        lr:           float = 0.1,
-        gamma:        float = 0.95,
-        action_scale: float = 1.0,
+        states:          np.ndarray,
+        horizon:         int   = 10,
+        plan_iters:      int   = 20,
+        lr:              float = 0.1,
+        gamma:           float = 0.95,
+        action_scale:    float = 1.0,
+        objective:       str   = "value",   # "value" | "reward"
+        warm_start_u     = None,            # [N, H, action_dim] logit-space init
+        return_final_u:  bool  = False,     # if True return (actions, final_u_logits)
     ) -> np.ndarray:
         """
         Batched Block-Toeplitz GEMM planner for continuous action spaces.
@@ -343,7 +346,10 @@ class KoopmanGradientPlanner(nn.Module):
         # γ^0 … γ^{H-1} for path discounting
         gammas_path = gamma ** torch.arange(horizon, device=device, dtype=torch.float32)
 
-        u_logits = torch.zeros(N, horizon, action_dim, device=device, requires_grad=True)
+        if warm_start_u is not None:
+            u_logits = warm_start_u.to(device).clone().requires_grad_(True)
+        else:
+            u_logits = torch.zeros(N, horizon, action_dim, device=device, requires_grad=True)
         opt      = optim.Adam([u_logits], lr=lr)
 
         for _ in range(plan_iters):
@@ -360,19 +366,24 @@ class KoopmanGradientPlanner(nn.Module):
             path_rewards = agent.r_net(ZU).squeeze(-1)                 # [N, H]
             disc_path    = (gammas_path.unsqueeze(0) * path_rewards).sum(dim=1)  # [N]
 
-            # Terminal Q: Q(z_H, π(z_H)) — gradient flows through z_H and π
-            z_H  = Z[:, -1, :]                                         # [N, d]
-            a_H  = agent.pi_net(z_H)                                   # [N, action_dim]
-            q_H  = agent.q_net(torch.cat([z_H, a_H], -1)).squeeze(-1) # [N]
-
-            loss = -(disc_path + gamma ** horizon * q_H).mean()
+            if objective == "value":
+                # Terminal Q: Q(z_H, π(z_H)) — gradient flows through z_H and π
+                z_H  = Z[:, -1, :]                                     # [N, d]
+                a_H  = agent.pi_net(z_H)                               # [N, action_dim]
+                q_H  = agent.q_net(torch.cat([z_H, a_H], -1)).squeeze(-1)
+                loss = -(disc_path + gamma ** horizon * q_H).mean()
+            else:  # reward — r_net path only, no terminal Q
+                loss = -disc_path.mean()
 
             (grad_u,) = torch.autograd.grad(loss, u_logits, only_inputs=True)
             u_logits.grad = grad_u
             opt.step()
 
         with torch.no_grad():
-            return (torch.tanh(u_logits[:, 0, :]) * action_scale).cpu().numpy()
+            actions = (torch.tanh(u_logits[:, 0, :]) * action_scale).cpu().numpy()
+        if return_final_u:
+            return actions, u_logits.detach()
+        return actions
 
 
 

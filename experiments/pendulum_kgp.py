@@ -15,6 +15,7 @@ Success criterion: episode returns consistently above -300 in 30k steps.
 import argparse
 import os
 import sys
+import time
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -31,17 +32,21 @@ from matplotlib.gridspec import GridSpec
 from koopman_rl.config import (Config, EnvConfig, ModelConfig, BufferConfig,
                                 AlgoConfig, TrainConfig, PlannerConfig)
 from koopman_rl.trainer_continuous import train_continuous
+from koopman_rl.planner import plan_cem_gradient_batch, CEMPlannerWarmStart, ToeplitzPlannerWarmStart
 
 # ---------------------------------------------------------------------------
 # Pendulum-specific constants
 # ---------------------------------------------------------------------------
 ACTION_DIM       = 1
 ACTION_SCALE     = 2.0
-PLAN_HORIZON     = 2
-PLAN_ITERS       = 10
-VIZ_PLAN_HORIZON = 20   # longer horizon for viz plan rollouts (offline)
-VIZ_PLAN_ITERS   = 50   # more iters for viz (no speed pressure)
+PLAN_HORIZON     = 10   # online planning (benchmark + data collection)
+PLAN_ITERS       = 100   # online planning iterations
+VIZ_PLAN_HORIZON = 30   # offline viz: longer horizon so swing-up is visible
+VIZ_PLAN_ITERS   = 100   # offline viz: more iterations, no speed pressure
 VIZ_DIR          = "output/viz/pendulum"
+
+# Pendulum goal: upright at rest — [cos(0), sin(0), θ̇=0]
+PENDULUM_GOAL = np.array([1.0, 0.0, 0.0], dtype=np.float32)
 
 os.makedirs(VIZ_DIR, exist_ok=True)
 
@@ -68,7 +73,7 @@ def make_pendulum_cfg(args) -> Config:
             continuous=True,
         ),
         model=ModelConfig(
-            d=32,
+            d=16,
             lr=3e-4,
             ema_tau=0.005,
             ortho_a=True,
@@ -88,7 +93,7 @@ def make_pendulum_cfg(args) -> Config:
         ),
         train=TrainConfig(
             n_steps=args.steps,
-            warmup=15_000,
+            warmup=20_000,
             noise_start=1.0,
             noise_end=0.1,
             noise_decay=15_000,
@@ -102,6 +107,11 @@ def make_pendulum_cfg(args) -> Config:
         planner=PlannerConfig(
             horizon=PLAN_HORIZON,
             plan_iters=PLAN_ITERS,
+            lr=0.1,
+            cem_iters=10,
+            cem_samples=200,
+            cem_elites=20,
+            cem_grad_iters=PLAN_ITERS,
         ),
         run_name=run_name,
         seed=seed,
@@ -509,8 +519,7 @@ def plot_final_summary(agent, episode_returns, buf, cfg=None):
             z0 = agent.encoder(
                 torch.tensor(hang_state, dtype=torch.float32).unsqueeze(0).to(device)
             )
-        u_logits = torch.randn(VIZ_PLAN_HORIZON, ACTION_DIM, device=device) * 1e-4
-        u_logits.requires_grad_(True)
+        u_logits = torch.zeros(VIZ_PLAN_HORIZON, ACTION_DIM, device=device, requires_grad=True)
         opt_tmp = optim.Adam([u_logits], lr=0.05)
         for _ in range(VIZ_PLAN_ITERS):
             opt_tmp.zero_grad()
@@ -700,83 +709,174 @@ def plot_policy_vs_planner(agent, cfg, max_steps=200):
     colors = ['#e377c2', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#17becf']
 
     def _run_from(s0, action_fn):
+        """Run one episode from s0. Returns (states, return, mean_ms_per_step)."""
+        if hasattr(action_fn, "reset"):
+            action_fn.reset()   # discard warm-start state from previous episode
         ev = gym.make("Pendulum-v1")
         ev.reset()
         theta = np.arctan2(float(s0[1]), float(s0[0]))
         ev.unwrapped.state = np.array([theta, float(s0[2])])
         s = s0.copy()
-        states, ret = [s.copy()], 0.0
+        states, ret, step_times = [s.copy()], 0.0, []
         for _ in range(max_steps):
+            t0 = time.perf_counter()
             a = action_fn(s)
+            step_times.append(time.perf_counter() - t0)
             s, r, term, trunc, _ = ev.step(np.atleast_1d(a).astype(np.float32))
             states.append(s.copy())
             ret += r
             if term or trunc:
                 break
         ev.close()
-        return np.array(states, dtype=np.float32), ret
+        return np.array(states, dtype=np.float32), ret, float(np.mean(step_times)) * 1e3
 
     try:
         _vg = _value_grid(agent)
     except Exception:
         _vg = None
 
-    fig, (ax_pol, ax_plan, ax_ret) = plt.subplots(1, 3, figsize=(18, 7))
+    device = next(agent.parameters()).device
+    with torch.no_grad():
+        z_goal = agent.encoder(
+            torch.tensor(PENDULUM_GOAL[np.newaxis], dtype=torch.float32, device=device)
+        )  # [1, d]
+
+    cem_iters   = cfg.planner.cem_iters
+    cem_samples = cfg.planner.cem_samples
+    cem_elites  = cfg.planner.cem_elites
+    cem_grad    = cfg.planner.cem_grad_iters
+
+    fig, (ax_pol, ax_plan, ax_vfree, ax_cem, ax_ret) = plt.subplots(1, 5, figsize=(30, 7))
     fig.suptitle(
-        f"Direct Policy vs Toeplitz MPC — Real Env Trajectories  "
-        f"(H={plan_horizon}  iters={plan_iters})",
-        fontsize=12,
+        f"Direct Policy vs Grad Value-Based vs Value-Free vs CEM Value-Based vs CEM Value-Free  "
+        f"(H={plan_horizon}  plan_iters={plan_iters}  cem={cem_iters}×{cem_samples}+{cem_grad}grad)",
+        fontsize=11,
     )
 
-    for ax, title in [(ax_pol, "Direct Policy"), (ax_plan, f"Toeplitz MPC")]:
+    # 2×3 grid: [Policy | Grad Value-Based | Grad Value-Free]
+    #           [CEM Value-Based | CEM Value-Free | Returns Bar]
+    fig_cmp, axes_cmp = plt.subplots(2, 3, figsize=(18, 12))
+    fig_cmp.suptitle(
+        f"Planner Comparison — Value-Based vs Value-Free × Grad vs CEM  "
+        f"(H={plan_horizon}  plan_iters={plan_iters}  cem={cem_iters}×{cem_samples}+{cem_grad}grad)",
+        fontsize=11,
+    )
+    ax_pol   = axes_cmp[0, 0]
+    ax_plan  = axes_cmp[0, 1]
+    ax_vfree = axes_cmp[0, 2]
+    ax_cem_v = axes_cmp[1, 0]
+    ax_cem_f = axes_cmp[1, 1]
+    ax_ret   = axes_cmp[1, 2]
+
+    traj_axes = [
+        (ax_pol,   "Policy (π direct)"),
+        (ax_plan,  "Grad Value-Based (r_net+Q)"),
+        (ax_vfree, "Grad Value-Free (‖z_H−z_goal‖²)"),
+        (ax_cem_v, f"CEM Value-Based ({cem_iters}×{cem_samples}+{cem_grad}g)"),
+        (ax_cem_f, f"CEM Value-Free  ({cem_iters}×{cem_samples}+{cem_grad}g)"),
+    ]
+    for ax, title in traj_axes:
         if _vg is not None:
             _, _, V_grid = _vg
             ax.imshow(V_grid, extent=[-np.pi, np.pi, -8, 8],
                       aspect="auto", origin="lower", cmap="viridis", alpha=0.35)
         ax.axvline(0, color="white", lw=0.8, alpha=0.6)
-        ax.set_xlim(-np.pi, np.pi)
-        ax.set_ylim(-8, 8)
-        ax.set_xticks([-np.pi, -np.pi / 2, 0, np.pi / 2, np.pi])
+        ax.set_xlim(-np.pi, np.pi); ax.set_ylim(-8, 8)
+        ax.set_xticks([-np.pi, -np.pi/2, 0, np.pi/2, np.pi])
         ax.set_xticklabels(["-π", "-π/2", "0", "π/2", "π"])
-        ax.set_xlabel("θ (rad)")
-        ax.set_ylabel("θ̇ (rad/s)")
-        ax.set_title(title)
+        ax.set_xlabel("θ (rad)"); ax.set_ylabel("θ̇ (rad/s)")
+        ax.set_title(title, fontsize=9)
 
-    pol_rets, plan_rets = [], []
+    pol_rets, plan_rets, vfree_rets, cem_val_rets, cem_vfree_rets = [], [], [], [], []
+    pol_ms,   plan_ms,  vfree_ms,  cem_val_ms,   cem_vfree_ms   = [], [], [], [], []
 
     for (label, s0), col in zip(starts, colors):
-        # ── policy episode ───────────────────────────────────────────────────
-        pol_states, pol_ret = _run_from(
-            s0, lambda s: agent.act_policy_continuous_batch(
-                s[np.newaxis], action_scale)[0])
+        # ── policy ───────────────────────────────────────────────────────────
+        pol_states, pol_ret, ms = _run_from(
+            s0, lambda s: agent.act_policy_continuous_batch(s[np.newaxis], action_scale)[0])
+        pol_ms.append(ms)
         th, td = _to_theta_thetadot(pol_states)
         ax_pol.plot(th, td, color=col, lw=1.6, alpha=0.85)
-        ax_pol.plot(th[0],  td[0],  "o", color=col, ms=8, zorder=5)
-        ax_pol.plot(th[-1], td[-1], "*", color=col, ms=10, zorder=5,
+        ax_pol.plot(th[0], td[0], "o", color=col, ms=7, zorder=5)
+        ax_pol.plot(th[-1], td[-1], "*", color=col, ms=9, zorder=5,
                     label=f"{label}  {pol_ret:.0f}")
 
-        # ── planner episode ──────────────────────────────────────────────────
-        plan_states, plan_ret = _run_from(
+        # ── grad value-based ─────────────────────────────────────────────────
+        plan_states, plan_ret, ms = _run_from(
             s0, lambda s: agent.act_plan_continuous(
                 s[np.newaxis], plan_horizon, plan_iters,
                 gamma=gamma, action_scale=action_scale)[0])
+        plan_ms.append(ms)
         th, td = _to_theta_thetadot(plan_states)
         ax_plan.plot(th, td, color=col, lw=1.6, alpha=0.85)
-        ax_plan.plot(th[0],  td[0],  "o", color=col, ms=8, zorder=5)
-        ax_plan.plot(th[-1], td[-1], "*", color=col, ms=10, zorder=5,
+        ax_plan.plot(th[0], td[0], "o", color=col, ms=7, zorder=5)
+        ax_plan.plot(th[-1], td[-1], "*", color=col, ms=9, zorder=5,
                      label=f"{label}  {plan_ret:.0f}")
 
-        pol_rets.append(pol_ret)
-        plan_rets.append(plan_ret)
+        # ── grad value-free (min ‖z_H − z_goal‖²) ───────────────────────────
+        vfree_states, vfree_ret, ms = _run_from(
+            s0, lambda s: _value_free_act_batch(
+                agent, s[np.newaxis], z_goal,
+                plan_horizon, plan_iters, gamma, action_scale)[0])
+        vfree_ms.append(ms)
+        th, td = _to_theta_thetadot(vfree_states)
+        ax_vfree.plot(th, td, color=col, lw=1.6, alpha=0.85)
+        ax_vfree.plot(th[0], td[0], "o", color=col, ms=7, zorder=5)
+        ax_vfree.plot(th[-1], td[-1], "*", color=col, ms=9, zorder=5,
+                      label=f"{label}  {vfree_ret:.0f}")
 
-    ax_pol.legend(fontsize=7, loc="upper right")
-    ax_plan.legend(fontsize=7, loc="upper right")
+        # ── CEM value-based (warm-start) ─────────────────────────────────────
+        cem_v_states, cem_val_ret, ms = _run_from(
+            s0, CEMPlannerWarmStart(
+                agent, plan_horizon, cem_iters, cem_samples, cem_elites,
+                cem_grad, 0.1, gamma, action_scale, objective="value"))
+        cem_val_ms.append(ms)
+        th, td = _to_theta_thetadot(cem_v_states)
+        ax_cem_v.plot(th, td, color=col, lw=1.6, alpha=0.85)
+        ax_cem_v.plot(th[0], td[0], "o", color=col, ms=7, zorder=5)
+        ax_cem_v.plot(th[-1], td[-1], "*", color=col, ms=9, zorder=5,
+                      label=f"{label}  {cem_val_ret:.0f}")
+
+        # ── CEM value-free (warm-start) ──────────────────────────────────────
+        cem_f_states, cem_vfree_ret, ms = _run_from(
+            s0, CEMPlannerWarmStart(
+                agent, plan_horizon, cem_iters, cem_samples, cem_elites,
+                cem_grad, 0.1, gamma, action_scale,
+                objective="value_free", z_goal=z_goal))
+        cem_vfree_ms.append(ms)
+        th, td = _to_theta_thetadot(cem_f_states)
+        ax_cem_f.plot(th, td, color=col, lw=1.6, alpha=0.85)
+        ax_cem_f.plot(th[0], td[0], "o", color=col, ms=7, zorder=5)
+        ax_cem_f.plot(th[-1], td[-1], "*", color=col, ms=9, zorder=5,
+                      label=f"{label}  {cem_vfree_ret:.0f}")
+
+        pol_rets.append(pol_ret);       plan_rets.append(plan_ret)
+        vfree_rets.append(vfree_ret);   cem_val_rets.append(cem_val_ret)
+        cem_vfree_rets.append(cem_vfree_ret)
+
+    # Update trajectory panel titles with measured per-step planning time
+    timing_labels = [
+        (ax_pol,   "Policy (π direct)",                  pol_ms),
+        (ax_plan,  "Grad value-based (r_net+Q)",         plan_ms),
+        (ax_vfree, "Grad value-free (‖z_H−z_goal‖²)",   vfree_ms),
+        (ax_cem_v, f"CEM value-based ({cem_iters}×{cem_samples}+{cem_grad}g)", cem_val_ms),
+        (ax_cem_f, f"CEM value-free  ({cem_iters}×{cem_samples}+{cem_grad}g)", cem_vfree_ms),
+    ]
+    print("\n  [planner timing]")
+    for ax, title, ms_list in timing_labels:
+        mean_ms = float(np.mean(ms_list))
+        ax.set_title(f"{title}\n{mean_ms:.1f} ms/step", fontsize=9)
+        ax.legend(fontsize=6, loc="upper right")
+        print(f"    {title:<45s}  {mean_ms:6.2f} ms/step")
 
     # ── return bar chart ──────────────────────────────────────────────────────
     x = np.arange(len(starts))
-    w = 0.35
-    ax_ret.bar(x - w / 2, pol_rets,  w, label="Policy",       color="#4c8bc9", alpha=0.85)
-    ax_ret.bar(x + w / 2, plan_rets, w, label="Toeplitz MPC", color="#ff7f0e", alpha=0.85)
+    w = 0.14
+    ax_ret.bar(x - 2*w,   pol_rets,       w, label="Policy",            color="#4c8bc9", alpha=0.85)
+    ax_ret.bar(x - w,     plan_rets,      w, label="Grad value-based",  color="#ff7f0e", alpha=0.85)
+    ax_ret.bar(x,         vfree_rets,     w, label="Grad value-free",   color="#9467bd", alpha=0.85)
+    ax_ret.bar(x + w,     cem_val_rets,   w, label="CEM value-based",   color="#2ca02c", alpha=0.85)
+    ax_ret.bar(x + 2*w,   cem_vfree_rets, w, label="CEM value-free",    color="#d62728", alpha=0.85)
     ax_ret.axhline(-300, color="green", ls="--", lw=1.2, label="−300 target")
     ax_ret.set_xticks(x)
     ax_ret.set_xticklabels([l for l, _ in starts], rotation=20, ha="right", fontsize=8)
@@ -785,8 +885,1130 @@ def plot_policy_vs_planner(agent, cfg, max_steps=200):
     ax_ret.legend(fontsize=9)
     ax_ret.grid(alpha=0.3)
 
-    plt.tight_layout()
+    fig_cmp.tight_layout()
     path = os.path.join(VIZ_DIR, "policy_vs_planner.png")
+    fig_cmp.savefig(path, dpi=110, bbox_inches="tight")
+    plt.close(fig_cmp)
+    print(f"  [viz] {path}")
+
+
+def _plan_objectives(agent, z0, z_goal, horizon, plan_iters, gamma):
+    """
+    Run both planners from z0, capturing their objectives at each Adam iteration.
+
+    Value-MPC   (maximised): J = Σ_t γ^t r_net(z_t, u_t) + γ^H Q(z_H, π(z_H))
+    Value-free  (minimised): D = ‖z_H − z_goal‖²
+
+    Returns val_curve [plan_iters+1], vfree_curve [plan_iters+1], u_val, u_vfree.
+    """
+    device = z0.device
+    d = agent.d
+    action_dim = agent.B.shape[1]
+
+    with torch.no_grad():
+        B = agent.B.detach()
+        W_toeplitz, _, A_stack = agent.get_toeplitz_cache(horizon, gamma)
+        ZIR = torch.einsum('kij,nj->nki', A_stack[1:], z0)  # [1, H, d]
+
+    gammas_path = gamma ** torch.arange(horizon, device=device, dtype=torch.float32)
+
+    u_val  = torch.zeros(1, horizon, action_dim, device=device, requires_grad=True)
+    u_jepa = torch.zeros(1, horizon, action_dim, device=device, requires_grad=True)
+    opt_val  = optim.Adam([u_val],  lr=0.1)
+    opt_jepa = optim.Adam([u_jepa], lr=0.1)
+
+    val_curve, vfree_curve = [], []
+
+    for it in range(plan_iters + 1):
+        # snapshot both objectives before taking the step
+        with torch.no_grad():
+            u = torch.tanh(u_val)
+            X_flat = (u @ B.T).reshape(1, horizon * d)
+            Z = ZIR + (X_flat @ W_toeplitz.T).reshape(1, horizon, d)
+            Z_curr = torch.cat([z0.unsqueeze(1), Z[:, :-1, :]], dim=1)
+            ZU = torch.cat([Z_curr, u], dim=-1)
+            disc = (gammas_path * agent.r_net(ZU).squeeze(-1)).sum(dim=1)
+            z_H = Z[:, -1, :]
+            a_H = agent.pi_net(z_H)
+            q_H = agent.q_net(torch.cat([z_H, a_H], -1)).squeeze(-1)
+            val_curve.append((disc + gamma ** horizon * q_H).mean().item())
+
+            u_j = torch.tanh(u_jepa)
+            X_j = (u_j @ B.T).reshape(1, horizon * d)
+            Z_j = ZIR + (X_j @ W_toeplitz.T).reshape(1, horizon, d)
+            z_H_j = Z_j[:, -1, :]
+            vfree_curve.append(((z_H_j - z_goal) ** 2).sum(dim=-1).mean().item())
+
+        if it < plan_iters:
+            # value step
+            opt_val.zero_grad()
+            u = torch.tanh(u_val)
+            X_flat = (u @ B.T).reshape(1, horizon * d)
+            Z = ZIR + (X_flat @ W_toeplitz.T).reshape(1, horizon, d)
+            Z_curr = torch.cat([z0.unsqueeze(1), Z[:, :-1, :]], dim=1)
+            ZU = torch.cat([Z_curr, u], dim=-1)
+            disc = (gammas_path * agent.r_net(ZU).squeeze(-1)).sum(dim=1)
+            z_H = Z[:, -1, :]
+            a_H = agent.pi_net(z_H)
+            q_H = agent.q_net(torch.cat([z_H, a_H], -1)).squeeze(-1)
+            loss_val = -(disc + gamma ** horizon * q_H).mean()
+            (g_val,) = torch.autograd.grad(loss_val, u_val, only_inputs=True)
+            u_val.grad = g_val
+            opt_val.step()
+
+            # value-free step
+            opt_jepa.zero_grad()
+            u_j = torch.tanh(u_jepa)
+            X_j = (u_j @ B.T).reshape(1, horizon * d)
+            Z_j = ZIR + (X_j @ W_toeplitz.T).reshape(1, horizon, d)
+            z_H_j = Z_j[:, -1, :]
+            loss_jepa = ((z_H_j - z_goal.detach()) ** 2).sum(dim=-1).mean()
+            (g_jepa,) = torch.autograd.grad(loss_jepa, u_jepa, only_inputs=True)
+            u_jepa.grad = g_jepa
+            opt_jepa.step()
+
+    return val_curve, vfree_curve, u_val.detach(), u_jepa.detach()
+
+
+def _value_free_act_batch(agent, states: np.ndarray, z_goal,
+                    horizon, plan_iters, gamma, action_scale) -> np.ndarray:
+    """
+    Value-free gradient planner: min ‖z_H − z_goal‖².  Same Toeplitz structure as value MPC.
+    Returns actions [N, action_dim] ∈ [-action_scale, action_scale].
+    """
+    device = z_goal.device
+    d = agent.d
+    action_dim = agent.B.shape[1]
+    N = len(states)
+
+    with torch.no_grad():
+        z0 = agent.encoder(torch.tensor(states, dtype=torch.float32, device=device))
+        B = agent.B.detach()
+        W_toeplitz, _, A_stack = agent.get_toeplitz_cache(horizon, gamma)
+        ZIR = torch.einsum('kij,nj->nki', A_stack[1:], z0)  # [N, H, d]
+
+    u_logits = torch.zeros(N, horizon, action_dim, device=device, requires_grad=True)
+    opt = optim.Adam([u_logits], lr=0.1)
+
+    for _ in range(plan_iters):
+        opt.zero_grad()
+        u = torch.tanh(u_logits)
+        X_flat = (u @ B.T).reshape(N, horizon * d)
+        Z = ZIR + (X_flat @ W_toeplitz.T).reshape(N, horizon, d)
+        z_H = Z[:, -1, :]
+        loss = ((z_H - z_goal.detach()) ** 2).sum(dim=-1).mean()
+        (grad_u,) = torch.autograd.grad(loss, u_logits, only_inputs=True)
+        u_logits.grad = grad_u
+        opt.step()
+
+    with torch.no_grad():
+        return (torch.tanh(u_logits[:, 0, :]) * action_scale).cpu().numpy()
+
+
+def _cem_best_score(agent, z0, horizon, cem_iters, n_samples, n_elites, gamma):
+    """
+    Run the CEM phase only (no gradient polish) and return the best J
+    found after cem_iters rounds.  Used to annotate plan_convergence plots:
+    the returned value shows where CEM lands before gradient polish, which
+    is the warm-start point for the gradient phase.
+
+    Uses reduced n_samples for speed in the viz context.
+    """
+    device     = z0.device
+    d          = agent.d
+    action_dim = agent.B.shape[1]
+    N          = z0.shape[0]
+
+    with torch.no_grad():
+        B = agent.B.detach()
+        W_toeplitz, _, A_stack = agent.get_toeplitz_cache(horizon, gamma)
+        ZIR   = torch.einsum('kij,nj->nki', A_stack[1:], z0)  # [N, H, d]
+        ZIR_s = ZIR.unsqueeze(1).expand(N, n_samples, horizon, d)
+        gammas_path = gamma ** torch.arange(horizon, device=device, dtype=torch.float32)
+
+        mu    = torch.zeros(N, horizon, action_dim, device=device)
+        sigma = torch.ones(N, horizon, action_dim, device=device) * 2.0
+
+        for _ in range(cem_iters):
+            u_logits_s = (mu.unsqueeze(1)
+                          + sigma.unsqueeze(1)
+                          * torch.randn(N, n_samples, horizon, action_dim, device=device))
+            u_s    = torch.tanh(u_logits_s)
+            NS     = N * n_samples
+            X_flat = (u_s @ B.T).reshape(NS, horizon * d)
+            Z_path = (ZIR_s.reshape(NS, horizon, d)
+                      + (X_flat @ W_toeplitz.T).reshape(NS, horizon, d)
+                      ).reshape(N, n_samples, horizon, d)
+
+            z0_s   = z0.unsqueeze(1).unsqueeze(2).expand(N, n_samples, 1, d)
+            Z_curr = torch.cat([z0_s, Z_path[:, :, :-1, :]], dim=2)
+            ZU     = torch.cat([Z_curr, u_s], dim=-1)
+            disc_path = (gammas_path * agent.r_net(ZU).squeeze(-1)).sum(dim=2)
+
+            z_H    = Z_path[:, :, -1, :]
+            a_H    = agent.pi_net(z_H)
+            q_H    = agent.q_net(torch.cat([z_H, a_H], -1)).squeeze(-1)
+            scores = disc_path + gamma ** horizon * q_H
+
+            elite_idx    = scores.topk(n_elites, dim=1).indices
+            batch_idx    = torch.arange(N, device=device).unsqueeze(1).expand(N, n_elites)
+            elite_logits = u_logits_s[batch_idx, elite_idx]
+            mu    = elite_logits.mean(dim=1)
+            sigma = elite_logits.std(dim=1).clamp(min=1e-3)
+
+        # Score of the final CEM mean
+        u_best = torch.tanh(mu)
+        X_flat = (u_best @ B.T).reshape(N, horizon * d)
+        Z_path = ZIR + (X_flat @ W_toeplitz.T).reshape(N, horizon, d)
+        Z_curr = torch.cat([z0.unsqueeze(1), Z_path[:, :-1, :]], dim=1)
+        ZU     = torch.cat([Z_curr, u_best], dim=-1)
+        disc_path = (gammas_path.unsqueeze(0) * agent.r_net(ZU).squeeze(-1)).sum(dim=1)
+        z_H    = Z_path[:, -1, :]
+        a_H    = agent.pi_net(z_H)
+        q_H    = agent.q_net(torch.cat([z_H, a_H], -1)).squeeze(-1)
+        score  = (disc_path + gamma ** horizon * q_H).mean().item()
+    return score, mu.detach()
+
+
+def _cem_grad_curve(agent, z0, mu, horizon, grad_iters, gamma):
+    """
+    Run gradient polish starting from CEM mean mu, recording J at each step.
+    Returns curve [grad_iters+1] — one value before the first step, then one per step.
+    """
+    device     = z0.device
+    d          = agent.d
+    action_dim = agent.B.shape[1]
+
+    with torch.no_grad():
+        B = agent.B.detach()
+        W_toeplitz, _, A_stack = agent.get_toeplitz_cache(horizon, gamma)
+        ZIR = torch.einsum('kij,nj->nki', A_stack[1:], z0)
+    gammas_path = gamma ** torch.arange(horizon, device=device, dtype=torch.float32)
+
+    u_logits = mu.clone().requires_grad_(True)
+    opt = optim.Adam([u_logits], lr=0.1)
+    curve = []
+
+    for it in range(grad_iters + 1):
+        with torch.no_grad():
+            u      = torch.tanh(u_logits)
+            X_flat = (u @ B.T).reshape(1, horizon * d)
+            Z      = ZIR + (X_flat @ W_toeplitz.T).reshape(1, horizon, d)
+            Z_curr = torch.cat([z0.unsqueeze(1), Z[:, :-1, :]], dim=1)
+            ZU     = torch.cat([Z_curr, u], dim=-1)
+            disc   = (gammas_path * agent.r_net(ZU).squeeze(-1)).sum(dim=1)
+            z_H    = Z[:, -1, :]
+            a_H    = agent.pi_net(z_H)
+            q_H    = agent.q_net(torch.cat([z_H, a_H], -1)).squeeze(-1)
+            curve.append((disc + gamma ** horizon * q_H).mean().item())
+
+        if it < grad_iters:
+            opt.zero_grad()
+            u      = torch.tanh(u_logits)
+            X_flat = (u @ B.T).reshape(1, horizon * d)
+            Z      = ZIR + (X_flat @ W_toeplitz.T).reshape(1, horizon, d)
+            Z_curr = torch.cat([z0.unsqueeze(1), Z[:, :-1, :]], dim=1)
+            ZU     = torch.cat([Z_curr, u], dim=-1)
+            disc   = (gammas_path * agent.r_net(ZU).squeeze(-1)).sum(dim=1)
+            z_H    = Z[:, -1, :]
+            a_H    = agent.pi_net(z_H)
+            q_H    = agent.q_net(torch.cat([z_H, a_H], -1)).squeeze(-1)
+            loss   = -(disc + gamma ** horizon * q_H).mean()
+            (g,)   = torch.autograd.grad(loss, u_logits, only_inputs=True)
+            u_logits.grad = g
+            opt.step()
+
+    return curve
+
+
+# ---------------------------------------------------------------------------
+# CEM instrumented runner + diagnostics
+# ---------------------------------------------------------------------------
+
+def _run_cem_instrumented(agent, state: np.ndarray, cfg):
+    """
+    Run CEM+grad planner on a single state, capturing per-iteration internals.
+
+    Returns dict:
+      iter_scores  [cem_iters, n_samples] — raw J for all samples each CEM round
+      iter_best    [cem_iters]            — best J per round
+      iter_mu0     [cem_iters+1]          — mean first-action logit each round
+      iter_sigma0  [cem_iters+1]          — std  first-action logit each round
+      iter_best_u  [cem_iters, H]         — best sample action logits each round
+      cem_final_u  [H, action_dim]        — CEM mean before grad polish
+      polished_u   [H, action_dim]        — action logits after grad polish
+      J_cem        scalar                 — J at CEM mean
+      J_polished   scalar                 — J after grad polish
+      z0           [1, d]                 — encoded start state
+    """
+    device     = next(agent.parameters()).device
+    d          = agent.d
+    action_dim = agent.B.shape[1]
+    gamma      = cfg.algo.gamma
+    horizon    = cfg.planner.horizon
+    ci         = cfg.planner.cem_iters
+    ns         = cfg.planner.cem_samples
+    ne         = cfg.planner.cem_elites
+    gi         = cfg.planner.cem_grad_iters
+    lr         = cfg.planner.lr
+
+    with torch.no_grad():
+        z0 = agent.encoder(
+            torch.tensor(state[np.newaxis], dtype=torch.float32, device=device))
+        B = agent.B.detach()
+        W_toeplitz, _, A_stack = agent.get_toeplitz_cache(horizon, gamma)
+        ZIR       = torch.einsum('kij,nj->nki', A_stack[1:], z0)          # [1, H, d]
+        ZIR_s     = ZIR.unsqueeze(1).expand(1, ns, horizon, d)             # [1, ns, H, d]
+        gp        = gamma ** torch.arange(horizon, device=device, dtype=torch.float32)
+
+        mu    = torch.zeros(1, horizon, action_dim, device=device)
+        sigma = torch.ones(1, horizon, action_dim, device=device) * 2.0
+
+        iter_scores, iter_best, iter_mu0, iter_sigma0, iter_best_u = [], [], [], [], []
+        iter_mu0.append(mu[0, :, 0].cpu().numpy().copy())
+        iter_sigma0.append(sigma[0, :, 0].cpu().numpy().copy())
+
+        for _ in range(ci):
+            u_logits_s = (mu.unsqueeze(1)
+                          + sigma.unsqueeze(1)
+                          * torch.randn(1, ns, horizon, action_dim, device=device))
+            u_s = torch.tanh(u_logits_s)
+
+            X_flat = (u_s @ B.T).reshape(ns, horizon * d)
+            Z_path = (ZIR_s.reshape(ns, horizon, d)
+                      + (X_flat @ W_toeplitz.T).reshape(ns, horizon, d)
+                      ).reshape(1, ns, horizon, d)
+
+            z0_s   = z0.unsqueeze(1).unsqueeze(2).expand(1, ns, 1, d)
+            Z_curr = torch.cat([z0_s, Z_path[:, :, :-1, :]], dim=2)
+            ZU     = torch.cat([Z_curr, u_s], dim=-1)
+            disc   = (gp * agent.r_net(ZU).squeeze(-1)).sum(dim=2)         # [1, ns]
+            z_H    = Z_path[:, :, -1, :]
+            a_H    = agent.pi_net(z_H)
+            q_H    = agent.q_net(torch.cat([z_H, a_H], -1)).squeeze(-1)
+            scores = (disc + gamma ** horizon * q_H)[0]                     # [ns]
+
+            iter_scores.append(scores.cpu().numpy().copy())
+            iter_best.append(float(scores.max()))
+
+            best_idx = int(scores.argmax())
+            iter_best_u.append(u_logits_s[0, best_idx, :, 0].cpu().numpy().copy())
+
+            elite_idx    = scores.topk(ne).indices
+            elite_logits = u_logits_s[0, elite_idx]                         # [ne, H, ad]
+            mu    = elite_logits.mean(dim=0, keepdim=True)
+            sigma = elite_logits.std(dim=0, keepdim=True).clamp(min=1e-3)
+
+            iter_mu0.append(mu[0, :, 0].cpu().numpy().copy())
+            iter_sigma0.append(sigma[0, :, 0].cpu().numpy().copy())
+
+        # Score the CEM mean
+        def _score_u(u_tensor):
+            X = (u_tensor @ B.T).reshape(1, horizon * d)
+            Z = ZIR + (X @ W_toeplitz.T).reshape(1, horizon, d)
+            Zc = torch.cat([z0.unsqueeze(1), Z[:, :-1, :]], dim=1)
+            ZU = torch.cat([Zc, u_tensor], dim=-1)
+            disc = (gp.unsqueeze(0) * agent.r_net(ZU).squeeze(-1)).sum(dim=1)
+            z_H = Z[:, -1, :]
+            a_H = agent.pi_net(z_H)
+            q_H = agent.q_net(torch.cat([z_H, a_H], -1)).squeeze(-1)
+            return (disc + gamma ** horizon * q_H).item()
+
+        u_cem  = torch.tanh(mu)
+        J_cem  = _score_u(u_cem)
+        cem_final_u = mu[0].cpu().numpy()
+
+    # Grad polish
+    u_logits = mu.clone().requires_grad_(True)
+    opt = optim.Adam([u_logits], lr=lr)
+    for _ in range(gi):
+        opt.zero_grad()
+        u = torch.tanh(u_logits)
+        X = (u @ B.T).reshape(1, horizon * d)
+        Z = ZIR + (X @ W_toeplitz.T).reshape(1, horizon, d)
+        Zc = torch.cat([z0.unsqueeze(1), Z[:, :-1, :]], dim=1)
+        ZU = torch.cat([Zc, u], dim=-1)
+        disc = (gp.unsqueeze(0) * agent.r_net(ZU).squeeze(-1)).sum(dim=1)
+        z_H = Z[:, -1, :]
+        a_H = agent.pi_net(z_H)
+        q_H = agent.q_net(torch.cat([z_H, a_H], -1)).squeeze(-1)
+        loss = -(disc + gamma ** horizon * q_H).mean()
+        (g,) = torch.autograd.grad(loss, u_logits, only_inputs=True)
+        u_logits.grad = g
+        opt.step()
+
+    with torch.no_grad():
+        J_polished  = _score_u(torch.tanh(u_logits))
+        polished_u  = u_logits.detach()[0].cpu().numpy()
+
+    return dict(
+        iter_scores  = np.array(iter_scores),   # [ci, ns]
+        iter_best    = np.array(iter_best),      # [ci]
+        iter_mu0     = np.array(iter_mu0),       # [ci+1, H]
+        iter_sigma0  = np.array(iter_sigma0),    # [ci+1, H]
+        iter_best_u  = np.array(iter_best_u),    # [ci, H]
+        cem_final_u  = cem_final_u,              # [H, action_dim]
+        polished_u   = polished_u,               # [H, action_dim]
+        J_cem        = J_cem,
+        J_polished   = J_polished,
+        z0           = z0.cpu().numpy(),          # [1, d]
+    )
+
+
+def _execute_open_loop(start_state: np.ndarray, actions: np.ndarray):
+    """
+    Execute action sequence open-loop in Pendulum-v1 without replanning.
+    actions: [T, 1] or [T] actual torques in [-action_scale, action_scale].
+    Returns (states [T+1, 3], rewards [T]).
+    """
+    ev = gym.make("Pendulum-v1")
+    ev.reset()
+    theta = np.arctan2(float(start_state[1]), float(start_state[0]))
+    ev.unwrapped.state = np.array([theta, float(start_state[2])])
+    s       = start_state.copy()
+    states  = [s.copy()]
+    rewards = []
+    for a in actions:
+        s, r, term, trunc, _ = ev.step(np.atleast_1d(a).astype(np.float32))
+        states.append(s.copy())
+        rewards.append(r)
+        if term or trunc:
+            break
+    ev.close()
+    return np.array(states, dtype=np.float32), np.array(rewards, dtype=np.float32)
+
+
+def plot_model_rollout_accuracy(agent, cfg, n_steps: int = 200):
+    """
+    Compare a real policy rollout in Pendulum-v1 against the imagined rollout
+    obtained by applying the policy autoregressively in latent space:
+
+        z_{t+1} = A z_t + B u_t,   u_t = tanh(π(z_t)) · scale
+        ŝ_t     = decoder(z_t)
+
+    If the two trajectories match, the Koopman dynamics are faithful and any
+    planning failure is a policy / objective problem.
+    If they diverge quickly, the model-reality gap is the bottleneck.
+
+    Saves: output/viz/pendulum/model_rollout_accuracy.png
+    """
+    agent.eval()
+    device       = next(agent.parameters()).device
+    action_scale = cfg.env.action_scale
+    gamma        = cfg.algo.gamma
+
+    starts = [
+        ("hanging ω=0",   np.array([-1.0,  0.0,  0.0], np.float32)),
+        ("side ω=+3",     np.array([ 0.0,  1.0,  3.0], np.float32)),
+        ("near-top ω=0",  np.array([np.cos(0.3), np.sin(0.3), 0.0], np.float32)),
+        ("side ω=−3",     np.array([ 0.0, -1.0, -3.0], np.float32)),
+    ]
+    n_starts = len(starts)
+
+    # ── collect real and imagined rollouts ─────────────────────────────────────
+    real_states_all  = []   # [n_starts, T+1, 3]
+    imag_states_all  = []   # [n_starts, T+1, 3]  decoded latent rollout
+    real_actions_all = []   # [n_starts, T]
+    imag_actions_all = []   # [n_starts, T]
+
+    for _, s0 in starts:
+        # ---- real rollout ----
+        ev = gym.make("Pendulum-v1")
+        ev.reset()
+        theta_s0 = np.arctan2(float(s0[1]), float(s0[0]))
+        ev.unwrapped.state = np.array([theta_s0, float(s0[2])])
+        s = s0.copy()
+        real_states  = [s.copy()]
+        real_actions = []
+        for _ in range(n_steps):
+            a = agent.act_policy_continuous_batch(
+                s[np.newaxis], action_scale=action_scale)[0].astype(np.float32)
+            s, _, term, trunc, _ = ev.step(a)
+            real_states.append(s.copy())
+            real_actions.append(a.copy())
+            if term or trunc:
+                break
+        ev.close()
+
+        # ---- imagined rollout (latent autoregressive) ----
+        with torch.no_grad():
+            z = agent.encoder(
+                torch.tensor(s0[np.newaxis], dtype=torch.float32, device=device))
+            A = agent.A.detach()
+            B = agent.B.detach()
+            imag_states  = [agent.decoder(z).cpu().numpy()[0].copy()]
+            imag_actions = []
+            for _ in range(len(real_actions)):
+                u = agent.pi_net(z)                          # [1, action_dim]
+                a_imag = (torch.tanh(u) * action_scale).cpu().numpy()[0]
+                imag_actions.append(a_imag.copy())
+                z = z @ A.T + u @ B.T                        # z_{t+1} = Az_t + Bu_t
+                s_hat = agent.decoder(z).cpu().numpy()[0]
+                imag_states.append(s_hat.copy())
+
+        real_states_all.append(np.array(real_states,  dtype=np.float32))
+        imag_states_all.append(np.array(imag_states,  dtype=np.float32))
+        real_actions_all.append(np.array(real_actions, dtype=np.float32))
+        imag_actions_all.append(np.array(imag_actions, dtype=np.float32))
+
+    # ── plot ──────────────────────────────────────────────────────────────────
+    fig, axes = plt.subplots(3, n_starts, figsize=(4.5 * n_starts, 12), squeeze=False)
+    fig.suptitle(
+        "Model–Reality Gap: Real Policy Rollout vs Latent-Space Imagined Rollout\n"
+        "orange = imagined (z_{t+1}=Az_t+Bu_t, decoded)   blue = actual env",
+        fontsize=10,
+    )
+
+    try:
+        vg = _value_grid(agent)
+    except Exception:
+        vg = None
+
+    for col, (label, _) in enumerate(starts):
+        rs  = real_states_all[col]   # [T+1, 3]
+        im  = imag_states_all[col]   # [T+1, 3]
+        ra  = real_actions_all[col]  # [T]
+        ia  = imag_actions_all[col]  # [T]
+        T   = len(ra)
+        ts  = np.arange(T + 1)
+
+        real_th  = np.arctan2(rs[:, 1], rs[:, 0])
+        real_td  = rs[:, 2]
+        imag_th  = np.arctan2(im[:, 1], im[:, 0])
+        imag_td  = im[:, 2]
+
+        # Row 0 — phase portrait
+        ax = axes[0, col]
+        if vg is not None:
+            _, _, V_grid = vg
+            ax.imshow(V_grid, extent=[-np.pi, np.pi, -8, 8],
+                      aspect="auto", origin="lower", cmap="viridis", alpha=0.35)
+        ax.plot(real_th, real_td, "o-", color="#4c8bc9", lw=1.5, ms=2.5,
+                alpha=0.9, label="real")
+        ax.plot(imag_th, imag_td, "o-", color="#ff7f0e", lw=1.5, ms=2.5,
+                alpha=0.9, label="imagined")
+        ax.plot(real_th[0], real_td[0], "gs", ms=8, zorder=6, label="start")
+        ax.plot(real_th[-1], real_td[-1], "b^", ms=7, zorder=6)
+        ax.plot(imag_th[-1], imag_td[-1], "r^", ms=7, zorder=6)
+        ax.axvline(0, color="white", lw=0.8, alpha=0.5)
+        ax.set_xlim(-np.pi, np.pi); ax.set_ylim(-8, 8)
+        ax.set_xticks([-np.pi, 0, np.pi])
+        ax.set_xticklabels(["-π", "0", "π"], fontsize=8)
+        ax.set_title(label, fontsize=9)
+        ax.set_xlabel("θ"); ax.set_ylabel("θ̇")
+        if col == 0:
+            ax.legend(fontsize=7, loc="upper left")
+        ax.grid(alpha=0.2)
+
+        # Row 1 — angle and angular velocity time series
+        ax = axes[1, col]
+        ax.plot(ts, real_th, color="#4c8bc9", lw=1.5, label="θ real")
+        ax.plot(ts, imag_th, color="#ff7f0e", lw=1.5, ls="--", label="θ imagined")
+        ax.fill_between(ts, real_th, imag_th, alpha=0.15, color="#d62728")
+        ax.set_ylabel("θ (rad)")
+        ax.set_xlabel("step")
+        ax.axhline(0, color="gray", lw=0.6, ls=":")
+        if col == 0:
+            ax.legend(fontsize=7)
+        ax.grid(alpha=0.3)
+
+        ax2 = ax.twinx()
+        ax2.plot(ts, real_td, color="#2ca02c", lw=1.2, alpha=0.6, label="θ̇ real")
+        ax2.plot(ts, imag_td, color="#9467bd", lw=1.2, ls="--", alpha=0.6,
+                 label="θ̇ imag")
+        ax2.set_ylabel("θ̇ (rad/s)", fontsize=7)
+        if col == n_starts - 1:
+            ax2.legend(fontsize=6, loc="upper right")
+
+        # Row 2 — per-step decoded-state error and action comparison
+        ax = axes[2, col]
+        # State prediction error: use cosθ, sinθ, θ̇ directly (avoids angle-wrap)
+        err = np.linalg.norm(rs[:T+1] - im[:T+1], axis=1)
+        ax.plot(ts, err, color="#d62728", lw=1.5, label="||ŝ − s||")
+        ax.fill_between(ts, err, alpha=0.2, color="#d62728")
+        ax.set_ylabel("||ŝ − s||", color="#d62728")
+        ax.set_xlabel("step")
+
+        # Cumulative error
+        ax3 = ax.twinx()
+        ax3.plot(ts, np.cumsum(err) / (ts + 1), color="#8c564b", lw=1.2,
+                 ls=":", label="mean err")
+        ax3.set_ylabel("running mean err", fontsize=7)
+
+        # Annotate divergence step (first time err > 0.5)
+        div_steps = np.where(err > 0.5)[0]
+        if len(div_steps) > 0:
+            ax.axvline(div_steps[0], color="black", lw=1.2, ls="--",
+                       label=f"div t={div_steps[0]}")
+            ax.legend(fontsize=7)
+        ax.grid(alpha=0.3)
+
+    fig.tight_layout()
+    path = os.path.join(VIZ_DIR, "model_rollout_accuracy.png")
+    fig.savefig(path, dpi=110, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  [viz] {path}")
+
+
+def plot_cem_diagnostics(agent, cfg):
+    """
+    Four diagnostic figures checking whether the CEM hybrid planner works correctly.
+
+    Figure 1 — cem_score_evolution.png
+      Per-CEM-iteration score distributions, best score trajectory, and mu/sigma
+      evolution for 3 starting states.  Reveals whether CEM is finding better
+      trajectories or whether the J landscape is flat.
+
+    Figure 2 — cem_trajectory_evolution.png
+      Best-sample decoded trajectory at each CEM iteration from the hanging state.
+      Shows whether the zero-order search is finding committed swing-up actions.
+
+    Figure 3 — cem_open_loop.png
+      Planned latent trajectory (decoded) vs actual open-loop execution vs
+      closed-loop CEM MPC.  Diagnoses the model-reality gap.
+
+    Figure 4 — cem_reward_landscape.png
+      J(u[0]) landscape from hanging with the rest fixed, decomposed into
+      disc_path and γᴴQ.  Plus r_net predicted reward vs actual reward scatter.
+    """
+    agent.eval()
+    device       = next(agent.parameters()).device
+    gamma        = cfg.algo.gamma
+    horizon      = cfg.planner.horizon
+    action_scale = cfg.env.action_scale
+    reward_scale = cfg.algo.reward_scale
+    ci           = cfg.planner.cem_iters
+    d            = agent.d
+    action_dim   = agent.B.shape[1]
+
+    starts = [
+        ("hanging\nω=0",  np.array([-1.0,  0.0,  0.0], np.float32)),
+        ("side\nω=+3",    np.array([ 0.0,  1.0,  3.0], np.float32)),
+        ("side\nω=−3",    np.array([ 0.0, -1.0, -3.0], np.float32)),
+    ]
+
+    # Collect CEM diagnostics for all 3 starting states
+    diags = {}
+    for label, s0 in starts:
+        diags[label] = _run_cem_instrumented(agent, s0, cfg)
+
+    # ── Figure 1: Score distribution + mu/sigma evolution ─────────────────────
+    fig1, axes1 = plt.subplots(4, len(starts), figsize=(5 * len(starts), 14), squeeze=False)
+    fig1.suptitle(
+        f"CEM Internals — Score Evolution, mu/sigma  "
+        f"(H={horizon}  {ci}×{cfg.planner.cem_samples} samples  γ={gamma})",
+        fontsize=11,
+    )
+
+    cmap_iters = plt.cm.viridis(np.linspace(0.15, 0.95, ci))
+    iter_x     = np.arange(ci + 1)
+
+    for col, (label, s0) in enumerate(starts):
+        dg = diags[label]
+
+        # Row 0 — score histograms, one curve per CEM iteration
+        ax = axes1[0, col]
+        all_scores = dg["iter_scores"]   # [ci, ns]
+        score_min  = all_scores.min()
+        score_max  = all_scores.max()
+        bins = np.linspace(score_min, score_max, 40)
+        for i in range(ci):
+            counts, edges = np.histogram(all_scores[i], bins=bins, density=True)
+            ax.plot((edges[:-1] + edges[1:]) / 2, counts,
+                    color=cmap_iters[i], lw=1.2, alpha=0.85)
+        # Colorbar-style legend
+        sm = plt.cm.ScalarMappable(cmap="viridis",
+                                   norm=plt.Normalize(1, ci))
+        sm.set_array([])
+        fig1.colorbar(sm, ax=ax, label="CEM iter", fraction=0.046, pad=0.04)
+        ax.set_title(label.replace("\n", " "), fontsize=9)
+        ax.set_xlabel("J score")
+        if col == 0:
+            ax.set_ylabel("density")
+        ax.grid(alpha=0.3)
+
+        # Row 1 — best/mean score per iteration
+        ax = axes1[1, col]
+        ax.plot(np.arange(1, ci + 1), dg["iter_best"],
+                "o-", color="#2ca02c", lw=2, ms=5, label="best sample")
+        ax.plot(np.arange(1, ci + 1), all_scores.mean(axis=1),
+                "s--", color="#4c8bc9", lw=1.5, ms=4, label="mean sample")
+        ax.axhline(dg["J_cem"],      color="#ff7f0e", ls=":",  lw=1.5,
+                   label=f"CEM mean  J={dg['J_cem']:.3f}")
+        ax.axhline(dg["J_polished"], color="#d62728", ls="--", lw=1.5,
+                   label=f"After grad  J={dg['J_polished']:.3f}")
+        ax.set_xlabel("CEM iteration")
+        if col == 0:
+            ax.set_ylabel("J (value-MPC)")
+        ax.legend(fontsize=7)
+        ax.grid(alpha=0.3)
+
+        # Row 2 — mu[0] (first-step mean action logit → actual torque)
+        ax = axes1[2, col]
+        mu0_actual = np.tanh(dg["iter_mu0"][:, 0]) * action_scale   # [ci+1]
+        ax.plot(iter_x, mu0_actual, "o-", color="#9467bd", lw=2, ms=5)
+        ax.axhline(0, color="gray", lw=0.8, ls="--")
+        ax.set_ylim(-action_scale * 1.2, action_scale * 1.2)
+        ax.set_xlabel("CEM iteration")
+        if col == 0:
+            ax.set_ylabel("tanh(μ₁) × scale\n(first-step torque)")
+        ax.grid(alpha=0.3)
+
+        # Row 3 — sigma[0] (first-step std of action logit)
+        ax = axes1[3, col]
+        ax.plot(iter_x, dg["iter_sigma0"][:, 0], "o-", color="#e377c2", lw=2, ms=5)
+        ax.set_xlabel("CEM iteration")
+        if col == 0:
+            ax.set_ylabel("σ₁ (first-step logit std)")
+        ax.set_ylim(bottom=0)
+        ax.grid(alpha=0.3)
+
+    fig1.tight_layout()
+    path1 = os.path.join(VIZ_DIR, "cem_score_evolution.png")
+    fig1.savefig(path1, dpi=110, bbox_inches="tight")
+    plt.close(fig1)
+    print(f"  [viz] {path1}")
+
+    # ── Figure 2: Best-sample decoded trajectory per CEM iteration ─────────────
+    hang_label = starts[0][0]
+    hang_s0    = starts[0][1]
+    dg_hang    = diags[hang_label]
+
+    n_show    = min(ci, 6)
+    show_iters = np.round(np.linspace(0, ci - 1, n_show)).astype(int)
+
+    with torch.no_grad():
+        B          = agent.B.detach()
+        W_toeplitz, _, A_stack = agent.get_toeplitz_cache(horizon, gamma)
+        z0_t       = torch.tensor(dg_hang["z0"], dtype=torch.float32, device=device)
+        ZIR_hang   = torch.einsum('kij,nj->nki', A_stack[1:], z0_t)  # [1, H, d]
+
+    def _decode_u(u_logits_1d):
+        """u_logits_1d: [H] → (thetas, thetadots, actions_actual)"""
+        with torch.no_grad():
+            u_t = torch.tanh(
+                torch.tensor(u_logits_1d[:, np.newaxis], dtype=torch.float32, device=device)
+            ).unsqueeze(0)   # [1, H, 1]
+            X     = (u_t @ B.T).reshape(1, horizon * d)
+            Z     = ZIR_hang + (X @ W_toeplitz.T).reshape(1, horizon, d)
+            all_z = torch.cat([z0_t.unsqueeze(1), Z], dim=1).squeeze(0)  # [H+1, d]
+            dec   = agent.decoder(all_z).cpu().numpy()
+        th  = np.arctan2(dec[:, 1], dec[:, 0])
+        td  = dec[:, 2]
+        act = (np.tanh(u_logits_1d) * action_scale)
+        return th, td, act
+
+    try:
+        _vg = _value_grid(agent)
+    except Exception:
+        _vg = None
+
+    fig2, axes2 = plt.subplots(2, n_show, figsize=(3.5 * n_show, 7), squeeze=False)
+    fig2.suptitle(
+        f"CEM: Best-Sample Trajectory Evolution from Hanging  "
+        f"({ci} CEM iters + {cfg.planner.cem_grad_iters} grad polish)",
+        fontsize=10,
+    )
+
+    for col, it in enumerate(show_iters):
+        u_best = dg_hang["iter_best_u"][it]   # [H]
+
+        th, td, acts = _decode_u(u_best)
+
+        # Phase portrait
+        ax = axes2[0, col]
+        if _vg is not None:
+            _, _, V_grid = _vg
+            ax.imshow(V_grid, extent=[-np.pi, np.pi, -8, 8],
+                      aspect="auto", origin="lower", cmap="viridis", alpha=0.4)
+        ax.plot(th, td, "o-", lw=1.4, ms=3, color="#ff7f0e")
+        ax.plot(th[0],  td[0],  "go", ms=7, zorder=5)
+        ax.plot(th[-1], td[-1], "r*", ms=9, zorder=5)
+        ax.axvline(0, color="white", lw=0.8, alpha=0.5)
+        ax.set_xlim(-np.pi, np.pi); ax.set_ylim(-8, 8)
+        ax.set_xticks([-np.pi, 0, np.pi]); ax.set_xticklabels(["-π", "0", "π"], fontsize=7)
+        ax.set_title(f"CEM iter {it+1}\nJ={dg_hang['iter_best'][it]:.3f}", fontsize=9)
+        if col == 0:
+            ax.set_ylabel("θ̇", fontsize=8)
+
+        # Action bars
+        ax = axes2[1, col]
+        bar_cols = ["#e377c2" if a >= 0 else "#17becf" for a in acts]
+        ax.bar(np.arange(horizon), acts, color=bar_cols, alpha=0.85, width=0.7)
+        ax.axhline(0, color="black", lw=0.6)
+        ax.set_ylim(-action_scale * 1.2, action_scale * 1.2)
+        ax.set_xlabel("step", fontsize=7)
+        if col == 0:
+            ax.set_ylabel("torque", fontsize=8)
+
+    # Final polished plan
+    if n_show > 0:
+        th_p, td_p, acts_p = _decode_u(dg_hang["polished_u"][:, 0])
+        ax = axes2[0, -1]
+        ax.set_title(
+            f"After grad polish\nJ={dg_hang['J_polished']:.3f}", fontsize=9)
+        # Overlay polished trajectory in a different colour
+        if _vg is not None:
+            _, _, V_grid = _vg
+            ax.imshow(V_grid, extent=[-np.pi, np.pi, -8, 8],
+                      aspect="auto", origin="lower", cmap="viridis", alpha=0.4)
+        ax.plot(th_p, td_p, "o-", lw=1.4, ms=3, color="#d62728")
+        ax.plot(th_p[0],  td_p[0],  "go", ms=7, zorder=5)
+        ax.plot(th_p[-1], td_p[-1], "r*", ms=9, zorder=5)
+        ax.axvline(0, color="white", lw=0.8, alpha=0.5)
+        ax.set_xlim(-np.pi, np.pi); ax.set_ylim(-8, 8)
+        ax.set_xticks([-np.pi, 0, np.pi]); ax.set_xticklabels(["-π", "0", "π"], fontsize=7)
+        ax = axes2[1, -1]
+        bar_cols = ["#e377c2" if a >= 0 else "#17becf" for a in acts_p]
+        ax.bar(np.arange(horizon), acts_p, color=bar_cols, alpha=0.85, width=0.7)
+        ax.axhline(0, color="black", lw=0.6)
+        ax.set_ylim(-action_scale * 1.2, action_scale * 1.2)
+        ax.set_xlabel("step", fontsize=7)
+
+    fig2.tight_layout()
+    path2 = os.path.join(VIZ_DIR, "cem_trajectory_evolution.png")
+    fig2.savefig(path2, dpi=110, bbox_inches="tight")
+    plt.close(fig2)
+    print(f"  [viz] {path2}")
+
+    # ── Figure 3: Open-loop plan vs actual (model-reality gap) ─────────────────
+    cem_planner = CEMPlannerWarmStart(
+        agent,
+        horizon       = horizon,
+        cem_iters     = cfg.planner.cem_iters,
+        n_samples     = cfg.planner.cem_samples,
+        n_elites      = cfg.planner.cem_elites,
+        grad_iters    = cfg.planner.cem_grad_iters,
+        lr            = cfg.planner.lr,
+        gamma         = gamma,
+        action_scale  = action_scale,
+        objective     = "value",
+    )
+
+    fig3, axes3 = plt.subplots(3, len(starts), figsize=(5 * len(starts), 12), squeeze=False)
+    fig3.suptitle(
+        "Model–Reality Gap: CEM Planned (decoded) vs Open-Loop Actual vs Closed-Loop MPC",
+        fontsize=11,
+    )
+
+    for col, (label, s0) in enumerate(starts):
+        dg = diags[label]
+
+        # Decoded plan for this starting state
+        with torch.no_grad():
+            z0_c = torch.tensor(dg["z0"], dtype=torch.float32, device=device)
+            ZIR_c = torch.einsum('kij,nj->nki', A_stack[1:], z0_c)
+            u_t   = torch.tanh(
+                torch.tensor(dg["polished_u"], dtype=torch.float32, device=device)
+            ).unsqueeze(0)  # [1, H, action_dim]
+            X_c   = (u_t @ B.T).reshape(1, horizon * d)
+            Z_c   = ZIR_c + (X_c @ W_toeplitz.T).reshape(1, horizon, d)
+            all_z = torch.cat([z0_c.unsqueeze(1), Z_c], dim=1).squeeze(0)
+            dec   = agent.decoder(all_z).cpu().numpy()
+        th_plan  = np.arctan2(dec[:, 1], dec[:, 0])
+        td_plan  = dec[:, 2]
+        acts_plan = (np.tanh(dg["polished_u"][:, 0]) * action_scale)
+
+        # Open-loop actual execution
+        states_ol, rewards_ol = _execute_open_loop(s0, acts_plan[:, np.newaxis]
+                                                   if acts_plan.ndim == 1 else acts_plan)
+        th_ol, td_ol = _to_theta_thetadot(states_ol)
+
+        # Closed-loop MPC
+        cem_planner.reset()
+        ev_cl = gym.make("Pendulum-v1")
+        ev_cl.reset()
+        theta_s0 = np.arctan2(float(s0[1]), float(s0[0]))
+        ev_cl.unwrapped.state = np.array([theta_s0, float(s0[2])])
+        s_cl = s0.copy()
+        states_cl, rets_cl = [s_cl.copy()], 0.0
+        for _ in range(horizon * 4):   # run 4 planning horizons
+            a_cl = cem_planner(s_cl)
+            s_cl, r_cl, term, trunc, _ = ev_cl.step(np.atleast_1d(a_cl).astype(np.float32))
+            states_cl.append(s_cl.copy()); rets_cl += r_cl
+            if term or trunc:
+                break
+        ev_cl.close()
+        states_cl = np.array(states_cl, dtype=np.float32)
+        th_cl, td_cl = _to_theta_thetadot(states_cl)
+
+        # Predicted r_net rewards along open-loop trajectory
+        with torch.no_grad():
+            s_ol_t = torch.tensor(states_ol[:-1], dtype=torch.float32, device=device)
+            z_ol   = agent.encoder(s_ol_t)
+            a_ol_t = torch.tensor(acts_plan[:len(rewards_ol), np.newaxis],
+                                  dtype=torch.float32, device=device)
+            r_pred = agent.r_net(torch.cat([z_ol, a_ol_t], dim=-1)).squeeze(-1).cpu().numpy()
+        r_actual_scaled = np.array(rewards_ol) / reward_scale
+
+        # Phase portrait: planned (decoded)
+        for row, (th, td, col_h, lbl) in enumerate([
+            (th_plan, td_plan, "#ff7f0e", f"planned (decoded)  H={horizon}"),
+            (th_ol[:horizon+1], td_ol[:horizon+1], "#2ca02c",
+             f"open-loop actual  ret={rewards_ol.sum():.0f}"),
+            (th_cl, td_cl, "#d62728",
+             f"closed-loop MPC  ret={rets_cl:.0f}"),
+        ]):
+            ax = axes3[row, col]
+            if _vg is not None:
+                _, _, V_grid = _vg
+                ax.imshow(V_grid, extent=[-np.pi, np.pi, -8, 8],
+                          aspect="auto", origin="lower", cmap="viridis", alpha=0.35)
+            ax.plot(th, td, "o-", lw=1.5, ms=3, color=col_h)
+            ax.plot(th[0],  td[0],  "wo", ms=7, zorder=5)
+            ax.plot(th[-1], td[-1], "w*", ms=9, zorder=5)
+            ax.axvline(0, color="white", lw=0.8, alpha=0.5)
+            ax.set_xlim(-np.pi, np.pi); ax.set_ylim(-8, 8)
+            ax.set_xticks([-np.pi, 0, np.pi]); ax.set_xticklabels(["-π", "0", "π"], fontsize=7)
+            ax.set_xlabel("θ"); ax.set_ylabel("θ̇")
+            if row == 0:
+                ax.set_title(label.replace("\n", " "), fontsize=9)
+            if col == 0:
+                ax.set_ylabel(f"{lbl}\nθ̇", fontsize=8)
+            ax.grid(alpha=0.2)
+
+        # Annotate open-loop row with r_net vs actual reward
+        # (r_net prediction quality is the primary open-loop diagnostic)
+        T = len(rewards_ol)
+        axes3[1, col].set_title(
+            f"open-loop actual  ret={rewards_ol.sum():.0f}\n"
+            f"r_net MAE={(np.abs(r_pred[:T] - r_actual_scaled[:T])).mean():.3f}",
+            fontsize=8,
+        )
+
+    fig3.tight_layout()
+    path3 = os.path.join(VIZ_DIR, "cem_open_loop.png")
+    fig3.savefig(path3, dpi=110, bbox_inches="tight")
+    plt.close(fig3)
+    print(f"  [viz] {path3}")
+
+    # ── Figure 4: J landscape + r_net accuracy ──────────────────────────────────
+    fig4, axes4 = plt.subplots(2, 2, figsize=(12, 9))
+    fig4.suptitle("CEM: J Landscape & r_net / Q Accuracy", fontsize=11)
+
+    # [0,0] J(u[0]) landscape — sweep first-action logit, fix rest to 0
+    ax = axes4[0, 0]
+    u0_sweep = np.linspace(-3.0, 3.0, 80, dtype=np.float32)   # logit space
+    for (lbl, s0), col_h in zip(starts, ["#ff7f0e", "#2ca02c", "#d62728"]):
+        with torch.no_grad():
+            z0_sw = agent.encoder(
+                torch.tensor(s0[np.newaxis], dtype=torch.float32, device=device))
+            ZIR_sw = torch.einsum('kij,nj->nki', A_stack[1:], z0_sw)
+            gp     = gamma ** torch.arange(horizon, device=device, dtype=torch.float32)
+            J_vals = []
+            for u0_val in u0_sweep:
+                u_lgt = torch.zeros(1, horizon, action_dim, device=device)
+                u_lgt[0, 0, 0] = float(u0_val)
+                u_act = torch.tanh(u_lgt)
+                X   = (u_act @ B.T).reshape(1, horizon * d)
+                Z   = ZIR_sw + (X @ W_toeplitz.T).reshape(1, horizon, d)
+                Zc  = torch.cat([z0_sw.unsqueeze(1), Z[:, :-1, :]], dim=1)
+                ZU  = torch.cat([Zc, u_act], dim=-1)
+                disc = (gp.unsqueeze(0) * agent.r_net(ZU).squeeze(-1)).sum(dim=1)
+                z_H  = Z[:, -1, :]
+                a_H  = agent.pi_net(z_H)
+                q_H  = agent.q_net(torch.cat([z_H, a_H], -1)).squeeze(-1)
+                J_vals.append((disc + gamma ** horizon * q_H).item())
+        ax.plot(np.tanh(u0_sweep) * action_scale, J_vals,
+                color=col_h, lw=2, label=lbl.replace("\n", " "))
+    ax.set_xlabel("u[0] actual torque (fixed rest=0)")
+    ax.set_ylabel("J = Σγᵗr_net + γᴴQ")
+    ax.set_title("J landscape vs first action (rest zeros)")
+    ax.legend(fontsize=8); ax.grid(alpha=0.3)
+
+    # [0,1] Decompose J: disc_path vs gamma^H*Q for hanging sweep
+    ax = axes4[0, 1]
+    with torch.no_grad():
+        z0_h = agent.encoder(
+            torch.tensor(starts[0][1][np.newaxis], dtype=torch.float32, device=device))
+        ZIR_h = torch.einsum('kij,nj->nki', A_stack[1:], z0_h)
+        path_vals, q_vals = [], []
+        for u0_val in u0_sweep:
+            u_lgt = torch.zeros(1, horizon, action_dim, device=device)
+            u_lgt[0, 0, 0] = float(u0_val)
+            u_act = torch.tanh(u_lgt)
+            X   = (u_act @ B.T).reshape(1, horizon * d)
+            Z   = ZIR_h + (X @ W_toeplitz.T).reshape(1, horizon, d)
+            Zc  = torch.cat([z0_h.unsqueeze(1), Z[:, :-1, :]], dim=1)
+            ZU  = torch.cat([Zc, u_act], dim=-1)
+            disc = (gp.unsqueeze(0) * agent.r_net(ZU).squeeze(-1)).sum(dim=1).item()
+            z_H  = Z[:, -1, :]
+            a_H  = agent.pi_net(z_H)
+            q_H  = (gamma ** horizon * agent.q_net(torch.cat([z_H, a_H], -1)).squeeze(-1)).item()
+            path_vals.append(disc)
+            q_vals.append(q_H)
+    u0_actual = np.tanh(u0_sweep) * action_scale
+    ax.plot(u0_actual, path_vals, color="#2ca02c", lw=2, label="Σγᵗ r_net(z_t, u_t)")
+    ax.plot(u0_actual, q_vals,    color="#9467bd", lw=2, label=f"γᴴ Q(z_H, π(z_H))")
+    ax.plot(u0_actual, np.add(path_vals, q_vals), color="#ff7f0e", lw=2.5, ls="--", label="J total")
+    ax.axvline(0, color="gray", lw=0.8, ls=":")
+    ax.set_xlabel("u[0] actual torque"); ax.set_ylabel("value")
+    ax.set_title("J decomposed (hanging state)")
+    ax.legend(fontsize=8); ax.grid(alpha=0.3)
+
+    # [1,0] r_net predicted vs actual reward on random transitions
+    ax = axes4[1, 0]
+    ev_rnet = gym.make("Pendulum-v1")
+    r_preds_all, r_actual_all = [], []
+    for _ in range(8):   # 8 random episodes
+        s_rnet, _ = ev_rnet.reset()
+        for _ in range(25):
+            a_rnet = ev_rnet.action_space.sample()
+            s_next, r_true, term, trunc, _ = ev_rnet.step(a_rnet)
+            with torch.no_grad():
+                z_rnet = agent.encoder(
+                    torch.tensor(s_rnet[np.newaxis], dtype=torch.float32, device=device))
+                a_t    = torch.tensor(a_rnet[np.newaxis], dtype=torch.float32, device=device)
+                r_hat  = agent.r_net(torch.cat([z_rnet, a_t], dim=-1)).item()
+            r_preds_all.append(r_hat)
+            r_actual_all.append(r_true / reward_scale)
+            s_rnet = s_next
+            if term or trunc:
+                break
+    ev_rnet.close()
+    r_preds_all  = np.array(r_preds_all)
+    r_actual_all = np.array(r_actual_all)
+    corr = np.corrcoef(r_actual_all, r_preds_all)[0, 1]
+    ax.scatter(r_actual_all, r_preds_all, s=12, alpha=0.5, color="#4c8bc9")
+    lo = min(r_actual_all.min(), r_preds_all.min())
+    hi = max(r_actual_all.max(), r_preds_all.max())
+    ax.plot([lo, hi], [lo, hi], "k--", lw=1.2, label="ideal")
+    ax.set_xlabel("actual r / reward_scale")
+    ax.set_ylabel("r_net prediction")
+    ax.set_title(f"r_net accuracy  (Pearson r={corr:.3f})")
+    ax.legend(fontsize=8); ax.grid(alpha=0.3)
+
+    # [1,1] Q vs actual MC return from diverse starting states
+    ax = axes4[1, 1]
+    mc_starts = [
+        np.array([-1.0,  0.0,  0.0], np.float32),   # hang
+        np.array([ 0.0,  1.0,  3.0], np.float32),   # side+
+        np.array([ 0.0, -1.0, -3.0], np.float32),   # side-
+        np.array([np.cos(0.4), np.sin(0.4), 0.0], np.float32),  # near top
+        np.array([-1.0,  0.0,  2.0], np.float32),   # hang+vel
+    ]
+    for mc_s0 in mc_starts:
+        # Q prediction
+        with torch.no_grad():
+            z_mc = agent.encoder(
+                torch.tensor(mc_s0[np.newaxis], dtype=torch.float32, device=device))
+            a_mc = agent.pi_net(z_mc)
+            q_mc = agent.q_net(torch.cat([z_mc, a_mc], -1)).item()
+        # Monte-Carlo return from this state via policy
+        ev_mc = gym.make("Pendulum-v1")
+        ev_mc.reset()
+        th_mc = np.arctan2(float(mc_s0[1]), float(mc_s0[0]))
+        ev_mc.unwrapped.state = np.array([th_mc, float(mc_s0[2])])
+        s_mc = mc_s0.copy()
+        mc_ret, disc_factor = 0.0, 1.0
+        for _ in range(200):
+            a_mc_env = agent.act_policy_continuous_batch(
+                s_mc[np.newaxis], action_scale=action_scale)[0]
+            s_mc, r_mc, term, trunc, _ = ev_mc.step(a_mc_env.astype(np.float32))
+            mc_ret     += disc_factor * r_mc / reward_scale
+            disc_factor *= gamma
+            if term or trunc:
+                break
+        ev_mc.close()
+        ax.scatter([mc_ret], [q_mc], s=60, zorder=5)
+        ax.annotate(
+            f"θ={np.arctan2(mc_s0[1],mc_s0[0]):.1f}",
+            (mc_ret, q_mc), fontsize=6, ha="left", va="bottom")
+    lo_q = min(ax.get_xlim()[0], ax.get_ylim()[0])
+    hi_q = max(ax.get_xlim()[1], ax.get_ylim()[1])
+    ax.plot([lo_q, hi_q], [lo_q, hi_q], "k--", lw=1.2, label="ideal")
+    ax.set_xlabel("MC return (γ-discounted, / reward_scale)")
+    ax.set_ylabel("Q(z, π(z))")
+    ax.set_title("Q accuracy vs MC return")
+    ax.legend(fontsize=8); ax.grid(alpha=0.3)
+
+    fig4.tight_layout()
+    path4 = os.path.join(VIZ_DIR, "cem_reward_landscape.png")
+    fig4.savefig(path4, dpi=110, bbox_inches="tight")
+    plt.close(fig4)
+    print(f"  [viz] {path4}")
+
+
+def plot_plan_convergence(agent, cfg):
+    """
+    2-row × 3-col grid:
+    - Top row:    value-MPC objective J vs Adam iteration (one col per starting state)
+    - Bottom row: value-free ‖z_H − z_goal‖² vs Adam iteration (same cols)
+
+    Shows how quickly each planner converges and whether they plateau, oscillate,
+    or diverge from their respective basins.
+    """
+    agent.eval()
+    device = next(agent.parameters()).device
+    horizon    = cfg.planner.horizon
+    plan_iters = cfg.planner.plan_iters
+    gamma      = cfg.algo.gamma
+
+    with torch.no_grad():
+        z_goal = agent.encoder(
+            torch.tensor(PENDULUM_GOAL[np.newaxis], dtype=torch.float32, device=device)
+        )  # [1, d]
+
+    starts = [
+        ("hanging  ω=0",  np.array([-1.0,  0.0,  0.0], np.float32)),
+        ("side  ω=+3",    np.array([ 0.0,  1.0,  3.0], np.float32)),
+        ("side  ω=−3",    np.array([ 0.0, -1.0, -3.0], np.float32)),
+    ]
+    colors = ["#ff7f0e", "#2ca02c", "#d62728"]
+    iters  = np.arange(plan_iters + 1)
+
+    cem_iters   = cfg.planner.cem_iters
+    cem_samples = cfg.planner.cem_samples
+    cem_elites  = cfg.planner.cem_elites
+
+    fig, axes = plt.subplots(2, len(starts), figsize=(5 * len(starts), 8))
+    fig.suptitle(
+        f"Plan Convergence — Value-MPC (grad) vs Value-Free (grad) vs CEM warm-start  "
+        f"(H={horizon}  iters={plan_iters}  γ={gamma})",
+        fontsize=11,
+    )
+
+    for i, (label, s0) in enumerate(starts):
+        with torch.no_grad():
+            z0 = agent.encoder(
+                torch.tensor(s0[np.newaxis], dtype=torch.float32, device=device)
+            )
+
+        try:
+            val_curve, vfree_curve, _, _ = _plan_objectives(
+                agent, z0, z_goal, horizon, plan_iters, gamma)
+            cem_score, cem_mu = _cem_best_score(
+                agent, z0, horizon, cem_iters, cem_samples, cem_elites, gamma)
+            cem_grad_curve = _cem_grad_curve(
+                agent, z0, cem_mu, horizon, plan_iters, gamma)
+        except Exception as e:
+            for row in range(2):
+                axes[row, i].text(0.5, 0.5, str(e), ha="center", va="center",
+                                  transform=axes[row, i].transAxes)
+            continue
+
+        ax = axes[0, i]
+        ax.plot(iters, val_curve,      color=colors[i], lw=2,   label="grad (biased-init)")
+        ax.plot(iters, cem_grad_curve, color="#9467bd",  lw=2, ls="-.",
+                label=f"CEM→grad  J₀={cem_score:.3f}")
+        ax.axhline(cem_score, color="#9467bd", lw=1, ls=":",
+                   alpha=0.5, label="_nolegend_")
+        ax.set_title(label, fontsize=10)
+        ax.set_xlabel("Adam iteration")
+        if i == 0:
+            ax.set_ylabel("J = Σγᵗr_net + γᴴQ  [value-MPC]")
+        ax.legend(fontsize=7)
+        ax.grid(alpha=0.3)
+
+        ax = axes[1, i]
+        ax.plot(iters, vfree_curve, color=colors[i], lw=2, ls="--")
+        ax.set_xlabel("Adam iteration")
+        if i == 0:
+            ax.set_ylabel("‖z_H − z_goal‖²  [value-free]")
+        ax.grid(alpha=0.3)
+
+    plt.tight_layout()
+    path = os.path.join(VIZ_DIR, "plan_convergence.png")
     fig.savefig(path, dpi=110, bbox_inches="tight")
     plt.close(fig)
     print(f"  [viz] {path}")
@@ -798,6 +2020,178 @@ def _default_pendulum_cfg():
         env=EnvConfig(state_dim=3, n_actions=ACTION_DIM, action_scale=ACTION_SCALE),
         planner=PlannerConfig(horizon=PLAN_HORIZON, plan_iters=PLAN_ITERS),
     )
+
+
+# ---------------------------------------------------------------------------
+# Koopman latent space analysis
+# ---------------------------------------------------------------------------
+
+def plot_koopman_latent_analysis(agent, buf, cfg):
+    """
+    Four-panel Koopman latent space analysis.
+
+    Layout (2×4 GridSpec):
+      [0, 0:2] PCA trajectory + Q(z,0) contour  — the 'killer plot'
+      [0, 2]   Koopman flow field (Az − z) in PC1-PC2 space
+      [0, 3]   Eigenvalues of A on the complex plane
+      [1, 0-3] Latent dimension heatmaps z_0 … z_3 over (θ, θ̇)
+    """
+    agent.eval()
+    device     = next(agent.parameters()).device
+    d          = agent.d
+    action_dim = agent.B.shape[1]
+    action_scale = cfg.env.action_scale
+
+    # ── Encode buffer samples for PCA ────────────────────────────────────
+    n = min(buf.size, 4096)
+    idx = np.random.choice(buf.size, n, replace=False)
+    s_np = buf.states[idx]
+    with torch.no_grad():
+        Z = agent.encoder(
+            torch.tensor(s_np, dtype=torch.float32, device=device)
+        ).cpu().numpy()                                          # [N, d]
+
+    # PCA via SVD on centered Z — preserves linear geometry exactly
+    Z_mean = Z.mean(0)
+    Zc = Z - Z_mean
+    _, S_svd, Vt = np.linalg.svd(Zc, full_matrices=False)      # Vt: [d, d]
+    explained  = S_svd ** 2 / (S_svd ** 2).sum()
+    PC         = Vt[:2]                                          # [2, d]
+    Z_2d       = Zc @ PC.T                                       # [N, 2]
+
+    # ── Collect a real policy episode for trajectory overlay ─────────────
+    ep_states = []
+    ev = gym.make("Pendulum-v1")
+    ev.reset()
+    ev.unwrapped.state = np.array([-np.pi, 0.0])
+    s_ep = np.array([np.cos(-np.pi), np.sin(-np.pi), 0.0], np.float32)
+    for _ in range(200):
+        ep_states.append(s_ep.copy())
+        with torch.no_grad():
+            a = agent.act_policy_continuous_batch(
+                s_ep[np.newaxis], action_scale)[0]
+        s_ep, _, term, trunc, _ = ev.step(np.atleast_1d(a).astype(np.float32))
+        if term or trunc:
+            break
+    ev.close()
+    ep_states = np.array(ep_states, dtype=np.float32)
+    with torch.no_grad():
+        Z_ep = agent.encoder(
+            torch.tensor(ep_states, dtype=torch.float32, device=device)
+        ).cpu().numpy()
+    Z_ep_2d = (Z_ep - Z_mean) @ PC.T
+    ep_theta = np.arctan2(ep_states[:, 1], ep_states[:, 0])
+
+    # ── PC1-PC2 grid for contour + vector field ───────────────────────────
+    n_grid  = 40
+    pc1_lim = float(np.percentile(np.abs(Z_2d[:, 0]), 95)) * 1.3
+    pc2_lim = float(np.percentile(np.abs(Z_2d[:, 1]), 95)) * 1.3
+    g1 = np.linspace(-pc1_lim, pc1_lim, n_grid)
+    g2 = np.linspace(-pc2_lim, pc2_lim, n_grid)
+    GG1, GG2 = np.meshgrid(g1, g2)
+    G_2d  = np.stack([GG1.ravel(), GG2.ravel()], axis=1)        # [M, 2]
+    G_full = (G_2d @ PC + Z_mean).astype(np.float32)             # [M, d]
+
+    # Q(z, 0) contour
+    with torch.no_grad():
+        G_t    = torch.tensor(G_full, device=device)
+        a_zero = torch.zeros(len(G_t), action_dim, device=device)
+        q_grid = agent.q_net(torch.cat([G_t, a_zero], -1)).squeeze(-1).cpu().numpy()
+    Q_map = q_grid.reshape(n_grid, n_grid)
+
+    # Unforced Koopman flow: Δz = Az − z, projected to PC space
+    A_np       = agent.A.detach().cpu().numpy()                  # [d, d]
+    delta_full = G_full @ A_np.T - G_full                        # [M, d]
+    delta_2d   = delta_full @ PC.T                               # [M, 2]
+    U_q = delta_2d[:, 0].reshape(n_grid, n_grid)
+    V_q = delta_2d[:, 1].reshape(n_grid, n_grid)
+
+    # ── Eigenvalues of A ──────────────────────────────────────────────────
+    with torch.no_grad():
+        eigs   = torch.linalg.eig(agent.A).eigenvalues.cpu()
+    eig_re = eigs.real.numpy()
+    eig_im = eigs.imag.numpy()
+
+    # ── Latent dimension heatmaps over (θ, θ̇) ────────────────────────────
+    n_th, n_td = 60, 50
+    th_h  = np.linspace(-np.pi, np.pi, n_th, dtype=np.float32)
+    td_h  = np.linspace(-8.0,   8.0,   n_td, dtype=np.float32)
+    grid_s = np.stack([
+        np.tile(np.cos(th_h), n_td),
+        np.tile(np.sin(th_h), n_td),
+        np.repeat(td_h, n_th),
+    ], axis=1).astype(np.float32)
+    with torch.no_grad():
+        z_heat = agent.encoder(
+            torch.tensor(grid_s, device=device)
+        ).cpu().numpy()                                          # [n_td*n_th, d]
+
+    # ── Figure ────────────────────────────────────────────────────────────
+    fig = plt.figure(figsize=(20, 10))
+    gs  = GridSpec(2, 4, figure=fig, hspace=0.45, wspace=0.38)
+    fig.suptitle(
+        f"Koopman Latent Space Analysis  (d={d}  PC1={explained[0]*100:.1f}%"
+        f"  PC2={explained[1]*100:.1f}%)",
+        fontsize=13,
+    )
+
+    # [0, 0:2] PCA trajectory + Q(z,0) contour
+    ax = fig.add_subplot(gs[0, :2])
+    cf = ax.contourf(GG1, GG2, Q_map, levels=25, cmap="plasma", alpha=0.75)
+    plt.colorbar(cf, ax=ax, label="Q(z, 0)", fraction=0.046, pad=0.04)
+    sc = ax.scatter(Z_ep_2d[:, 0], Z_ep_2d[:, 1],
+                    c=ep_theta, cmap="hsv", s=14, zorder=3, alpha=0.9,
+                    vmin=-np.pi, vmax=np.pi)
+    plt.colorbar(sc, ax=ax, label="θ (rad)", fraction=0.046, pad=0.04)
+    ax.plot(Z_ep_2d[0,  0], Z_ep_2d[0,  1], "go", ms=9, zorder=4, label="start (hang)")
+    ax.plot(Z_ep_2d[-1, 0], Z_ep_2d[-1, 1], "r*", ms=11, zorder=4, label="end")
+    ax.set_xlabel(f"PC1 ({explained[0]*100:.1f}%)")
+    ax.set_ylabel(f"PC2 ({explained[1]*100:.1f}%)")
+    ax.set_title("Policy Episode Trajectory + Q(z, 0) Contour")
+    ax.legend(fontsize=8)
+
+    # [0, 2] Koopman flow field
+    ax2 = fig.add_subplot(gs[0, 2])
+    speed = np.sqrt(U_q**2 + V_q**2) + 1e-9
+    try:
+        ax2.streamplot(g1, g2, U_q, V_q, color=np.log1p(speed),
+                       cmap="cool", linewidth=0.9, density=1.3, arrowsize=0.9)
+    except Exception:
+        ax2.quiver(GG1[::4, ::4], GG2[::4, ::4],
+                   U_q[::4, ::4], V_q[::4, ::4], alpha=0.7)
+    ax2.set_xlabel("PC1"); ax2.set_ylabel("PC2")
+    ax2.set_title("Koopman Flow  Az − z  (unforced)")
+    ax2.set_xlim(-pc1_lim, pc1_lim); ax2.set_ylim(-pc2_lim, pc2_lim)
+
+    # [0, 3] Eigenvalues of A
+    ax3 = fig.add_subplot(gs[0, 3])
+    circ = np.linspace(0, 2 * np.pi, 300)
+    ax3.plot(np.cos(circ), np.sin(circ), "k--", lw=0.8, alpha=0.4, label="unit circle")
+    sc3 = ax3.scatter(eig_re, eig_im, c=np.abs(eig_im),
+                      cmap="viridis", s=35, zorder=3)
+    plt.colorbar(sc3, ax=ax3, label="|Im(λ)|", fraction=0.046, pad=0.04)
+    ax3.set_xlabel("Re(λ)"); ax3.set_ylabel("Im(λ)")
+    ax3.set_title(f"Eigenvalues of A\n‖AᵀA−I‖²={agent.ortho_error():.1e}")
+    ax3.set_aspect("equal"); ax3.grid(alpha=0.3); ax3.legend(fontsize=8)
+
+    # [1, 0-3] Latent dimension heatmaps z_0 … z_3
+    for i in range(4):
+        ax_h = fig.add_subplot(gs[1, i])
+        heat = z_heat[:, i].reshape(n_td, n_th)
+        vmax = np.abs(heat).max()
+        im = ax_h.imshow(heat, extent=[-np.pi, np.pi, -8, 8],
+                         aspect="auto", origin="lower",
+                         cmap="RdBu_r", vmin=-vmax, vmax=vmax)
+        plt.colorbar(im, ax=ax_h, fraction=0.046, pad=0.04)
+        ax_h.set_title(f"z_{i}  (latent dim {i})", fontsize=9)
+        ax_h.set_xlabel("θ (rad)"); ax_h.set_ylabel("θ̇")
+        ax_h.set_xticks([-np.pi, 0, np.pi])
+        ax_h.set_xticklabels(["-π", "0", "π"])
+
+    path = os.path.join(VIZ_DIR, "koopman_latent_analysis.png")
+    fig.savefig(path, dpi=120, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  [viz] {path}")
 
 
 # ---------------------------------------------------------------------------
@@ -825,11 +2219,81 @@ if __name__ == "__main__":
     cfg      = make_pendulum_cfg(args)
     live_png = os.path.join(VIZ_DIR, f"pendulum_live_{cfg.run_name}.png")
 
+    def _make_vfree_fn(agent):
+        """Factory: builds the value-free eval fn once the trained agent is available."""
+        dev = next(agent.parameters()).device
+        with torch.no_grad():
+            z_goal = agent.encoder(
+                torch.tensor(PENDULUM_GOAL[np.newaxis], dtype=torch.float32, device=dev)
+            )
+        return lambda ss: _value_free_act_batch(
+            agent, ss, z_goal,
+            cfg.planner.horizon, cfg.planner.plan_iters, cfg.algo.gamma, ACTION_SCALE)
+
+    def _make_cem_value_fn(agent):
+        """Factory: CEM value-based with receding-horizon warm-start."""
+        return CEMPlannerWarmStart(
+            agent,
+            horizon=cfg.planner.horizon,
+            cem_iters=cfg.planner.cem_iters,
+            n_samples=cfg.planner.cem_samples,
+            n_elites=cfg.planner.cem_elites,
+            grad_iters=cfg.planner.cem_grad_iters,
+            lr=cfg.planner.lr,
+            gamma=cfg.algo.gamma,
+            action_scale=ACTION_SCALE,
+            objective="value",
+        )
+
+    def _make_cem_vfree_fn(agent):
+        """Factory: CEM value-free with receding-horizon warm-start."""
+        dev = next(agent.parameters()).device
+        with torch.no_grad():
+            z_goal = agent.encoder(
+                torch.tensor(PENDULUM_GOAL[np.newaxis], dtype=torch.float32, device=dev)
+            )
+        return CEMPlannerWarmStart(
+            agent,
+            horizon=cfg.planner.horizon,
+            cem_iters=cfg.planner.cem_iters,
+            n_samples=cfg.planner.cem_samples,
+            n_elites=cfg.planner.cem_elites,
+            grad_iters=cfg.planner.cem_grad_iters,
+            lr=cfg.planner.lr,
+            gamma=cfg.algo.gamma,
+            action_scale=ACTION_SCALE,
+            objective="value_free",
+            z_goal=z_goal,
+        )
+
+    def _make_toeplitz_warm_fn(agent):
+        """Factory: Toeplitz MPC with receding-horizon warm-start."""
+        return ToeplitzPlannerWarmStart(
+            agent,
+            horizon=cfg.planner.horizon,
+            plan_iters=cfg.planner.plan_iters,
+            lr=cfg.planner.lr,
+            gamma=cfg.algo.gamma,
+            action_scale=ACTION_SCALE,
+            objective="value",
+        )
+
     result = train_continuous(
         cfg, "Pendulum-v1", device,
         on_viz=lambda **kw: _save_live_plot(**kw, path=live_png),
+        extra_eval_fns=[
+            ("grad value-free      ", _make_vfree_fn),
+            ("toeplitz warm-start  ", _make_toeplitz_warm_fn),
+            ("CEM value-based      ", _make_cem_value_fn),
+            ("CEM value-free       ", _make_cem_vfree_fn),
+        ],
     )
     agent = result["agent"]
-    plot_final_summary(agent, result["episode_returns"], result["buf"], cfg=cfg)
+    buf   = result["buf"]
+    plot_final_summary(agent, result["episode_returns"], buf, cfg=cfg)
     plot_plan_evolution(agent, cfg)
+    plot_plan_convergence(agent, cfg)
+    plot_model_rollout_accuracy(agent, cfg)
+    plot_cem_diagnostics(agent, cfg)
+    plot_koopman_latent_analysis(agent, buf, cfg)
     plot_policy_vs_planner(agent, cfg)
