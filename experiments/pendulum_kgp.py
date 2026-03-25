@@ -1306,10 +1306,13 @@ def plot_model_rollout_accuracy(agent, cfg, n_steps: int = 200):
     n_starts = len(starts)
 
     # ── collect real and imagined rollouts ─────────────────────────────────────
-    real_states_all  = []   # [n_starts, T+1, 3]
-    imag_states_all  = []   # [n_starts, T+1, 3]  decoded latent rollout
-    real_actions_all = []   # [n_starts, T]
-    imag_actions_all = []   # [n_starts, T]
+    real_states_all  = []   # [n_starts][T+1, 3]
+    imag_states_all  = []   # [n_starts][T+1, 3]  decoded latent rollout
+    real_actions_all = []   # [n_starts][T]
+    imag_actions_all = []   # [n_starts][T]
+    z_norm_real_all  = []   # [n_starts][T+1]  ||enc(s_t)|| for real states
+    z_norm_imag_all  = []   # [n_starts][T+1]  ||z_t|| for imagined rollout
+    z_latent_err_all = []   # [n_starts][T+1]  ||z_imag_t - enc(s_real_t)||
 
     for _, s0 in starts:
         # ---- real rollout ----
@@ -1329,30 +1332,45 @@ def plot_model_rollout_accuracy(agent, cfg, n_steps: int = 200):
             if term or trunc:
                 break
         ev.close()
+        T = len(real_actions)
 
-        # ---- imagined rollout (latent autoregressive) ----
+        # ---- imagined rollout + latent tracking ----
         with torch.no_grad():
-            z = agent.encoder(
-                torch.tensor(s0[np.newaxis], dtype=torch.float32, device=device))
+            real_s_t = torch.tensor(
+                np.array(real_states, dtype=np.float32), device=device)  # [T+1, 3]
+            z_real_all_t = agent.encoder(real_s_t)                        # [T+1, d]
+            z_norms_real = z_real_all_t.norm(dim=1).cpu().numpy()         # [T+1]
+
             A = agent.A.detach()
             B = agent.B.detach()
-            imag_states  = [agent.decoder(z).cpu().numpy()[0].copy()]
-            imag_actions = []
-            for _ in range(len(real_actions)):
-                u = agent.pi_net(z)                          # [1, action_dim]
+
+            z = z_real_all_t[:1].clone()   # start from encoder of s0
+            imag_states   = [agent.decoder(z).cpu().numpy()[0].copy()]
+            imag_actions  = []
+            z_norms_imag  = [z.norm().item()]
+            z_lat_errs    = [0.0]   # by definition equal at t=0
+
+            for t in range(T):
+                u = agent.pi_net(z)
                 a_imag = (torch.tanh(u) * action_scale).cpu().numpy()[0]
                 imag_actions.append(a_imag.copy())
-                z = z @ A.T + u @ B.T                        # z_{t+1} = Az_t + Bu_t
+                z = z @ A.T + u @ B.T
                 s_hat = agent.decoder(z).cpu().numpy()[0]
                 imag_states.append(s_hat.copy())
+                z_norms_imag.append(z.norm().item())
+                # latent error vs encoder of the actual real state at this step
+                z_lat_errs.append((z - z_real_all_t[t + 1:t + 2]).norm().item())
 
         real_states_all.append(np.array(real_states,  dtype=np.float32))
         imag_states_all.append(np.array(imag_states,  dtype=np.float32))
         real_actions_all.append(np.array(real_actions, dtype=np.float32))
         imag_actions_all.append(np.array(imag_actions, dtype=np.float32))
+        z_norm_real_all.append(np.array(z_norms_real,  dtype=np.float32))
+        z_norm_imag_all.append(np.array(z_norms_imag,  dtype=np.float32))
+        z_latent_err_all.append(np.array(z_lat_errs,   dtype=np.float32))
 
     # ── plot ──────────────────────────────────────────────────────────────────
-    fig, axes = plt.subplots(3, n_starts, figsize=(4.5 * n_starts, 12), squeeze=False)
+    fig, axes = plt.subplots(4, n_starts, figsize=(4.5 * n_starts, 15), squeeze=False)
     fig.suptitle(
         "Model–Reality Gap: Real Policy Rollout vs Latent-Space Imagined Rollout\n"
         "orange = imagined (z_{t+1}=Az_t+Bu_t, decoded)   blue = actual env",
@@ -1442,6 +1460,38 @@ def plot_model_rollout_accuracy(agent, cfg, n_steps: int = 200):
                        label=f"div t={div_steps[0]}")
             ax.legend(fontsize=7)
         ax.grid(alpha=0.3)
+
+        # Row 3 — latent norm evolution + latent-space divergence
+        ax = axes[3, col]
+        z_nr = z_norm_real_all[col]   # [T+1]  ||enc(s_t)||
+        z_ni = z_norm_imag_all[col]   # [T+1]  ||z_t_imag||
+        z_le = z_latent_err_all[col]  # [T+1]  ||z_imag - enc(s_real)||
+
+        ax.plot(ts, z_nr, color="#4c8bc9", lw=1.5, label="‖enc(sₜ)‖  real")
+        ax.plot(ts, z_ni, color="#ff7f0e", lw=1.5, ls="--",
+                label="‖zₜ‖  imagined")
+        ax.set_ylabel("latent norm ‖z‖")
+        ax.set_xlabel("step")
+        if col == 0:
+            ax.legend(fontsize=7, loc="upper left")
+        ax.grid(alpha=0.3)
+
+        # Latent divergence on twin axis — this is the core model-error signal
+        ax4 = ax.twinx()
+        ax4.plot(ts, z_le, color="#d62728", lw=1.5, alpha=0.85,
+                 label="‖zₜ_imag − enc(sₜ)‖")
+        ax4.fill_between(ts, z_le, alpha=0.12, color="#d62728")
+        ax4.set_ylabel("latent divergence", color="#d62728", fontsize=7)
+        # Mark when latent error first exceeds 1 (normalised by z norm)
+        lat_div_steps = np.where(z_le > 1.0)[0]
+        if len(lat_div_steps) > 0:
+            ax4.axvline(lat_div_steps[0], color="#d62728", lw=1.0, ls=":",
+                        alpha=0.7)
+            ax4.annotate(f"t={lat_div_steps[0]}",
+                         xy=(lat_div_steps[0], z_le[lat_div_steps[0]]),
+                         fontsize=6, color="#d62728", ha="left")
+        if col == n_starts - 1:
+            ax4.legend(fontsize=6, loc="lower right")
 
     fig.tight_layout()
     path = os.path.join(VIZ_DIR, "model_rollout_accuracy.png")
