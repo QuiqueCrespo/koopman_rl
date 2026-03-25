@@ -9,7 +9,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from experiments.pendulum_kgp import (
     make_pendulum_cfg, plot_final_summary, plot_plan_evolution,
     plot_plan_convergence, plot_policy_vs_planner, plot_koopman_latent_analysis,
-    plot_cem_diagnostics, plot_model_rollout_accuracy,
+    plot_cem_diagnostics, plot_model_rollout_accuracy, plot_natural_dynamics,
 )
 from koopman_rl.model import KoopmanGradientPlanner, TargetNetwork
 from koopman_rl.buffer import ContinuousReplayBuffer
@@ -54,5 +54,6 @@ plot_final_summary(agent, episode_returns, buf, cfg=cfg)
 plot_plan_evolution(agent, cfg)
 plot_plan_convergence(agent, cfg)
 plot_model_rollout_accuracy(agent, cfg)
+plot_natural_dynamics(agent, cfg)
 plot_cem_diagnostics(agent, cfg)
 plot_policy_vs_planner(agent, cfg)

@@ -1,6 +1,6 @@
 # Koopman-RL: Technical Reference
 
-A detailed account of the theory, derivations, and implementation choices behind the Koopman Gradient Planner with Block-Toeplitz GEMM and actor-critic continuous control.
+A detailed account of the theory, derivations, and implementation choices behind the Koopman Gradient Planner with Block-Toeplitz GEMM, CEM hybrid planner, and actor-critic continuous control.
 
 ---
 
@@ -58,13 +58,15 @@ Constraining $A \in O(d)$ ($A^\top A = I$) gives several benefits:
 
 1. **Isometry**: $\|Az\| = \|z\|$ for all $z$. The latent norm is preserved by $A$.
 
-2. **Stable powers**: $A^k$ remains exactly orthogonal for all $k$. Critical for the Block-Toeplitz planner.
+2. **Stable powers**: $A^k$ remains exactly orthogonal for all $k$. Critical for the Block-Toeplitz planner — without orthogonality, $A^k$ diverges exponentially if any singular value exceeds 1.
 
 3. **No normalisation needed**: Allows fully linear dynamics, required for Block-Toeplitz superposition.
 
 4. **Gradient stability**: SVD Procrustes gives a smooth, differentiable map from unconstrained weights to $O(d)$.
 
 5. **Numerical stability at float32**: An orthogonal matrix has condition number 1, so $A^H$ is well-conditioned at any horizon. No float64 is needed in the planner.
+
+**Ablation evidence**: removing the orthogonality constraint causes $\|A^\top A - I\|_F^2$ to stabilise at $\approx 2.5$ within the first few thousand steps. The Toeplitz planner then degrades to mean return $-1831$ (from $\approx -165$ with constraint), because $A^k$ diverges and the imagined $H$-step trajectory is meaningless. See Section 10.
 
 ---
 
@@ -81,7 +83,7 @@ $$z_{t+1} = A z_t + B u_t \qquad \text{(latent dynamics)}$$
 $$\hat{s}_t = g_\phi(z_t) \qquad \text{(decoder, reconstruction only)}$$
 
 where:
-- $z_t \in \mathbb{R}^d$ — latent state ($d = 32$ by default)
+- $z_t \in \mathbb{R}^d$ — latent state ($d = 16$)
 - $A \in O(d)$ — shared dynamics matrix, orthogonal
 - $B \in \mathbb{R}^{d \times m}$ — action input matrix ($m$ = action dimension)
 - $u_t \in \mathbb{R}^m$ — control input (one-hot for discrete; continuous vector for continuous envs)
@@ -97,7 +99,7 @@ def dyn_step(self, z, b_vec):
     return z @ A.T + b_vec
 ```
 
-With `ortho_a=True` (always the case for continuous envs), this is simply $z' = Az + b_\text{vec}$.
+With `ortho_a=True`, this is simply $z' = Az + b_\text{vec}$.
 
 ### Discrete vs Continuous Actions
 
@@ -283,43 +285,57 @@ $$a^* = \arg\max_a \; V_\psi\!\left(Az + B_{:,a}\right)$$
 
 One forward pass; no planning loop.
 
-### Random Shooting / Beam Search (Discrete)
-
-Random shooting samples $N$ random $H$-step sequences and scores by $V_\psi(z_H)$. Beam search keeps the top-$k$ partial sequences at each step. Both unchanged from the original implementation.
-
-### Gumbel-Softmax MPC (Discrete)
-
-Optimise action logits $\Theta \in \mathbb{R}^{H \times |\mathcal{A}|}$ with Adam. `hard=True` forward pass gives strict one-hot actions (no ghost-state blending); STE backward flows gradients through the argmax.
-
-### Direct Policy (Continuous, data collection)
-
-```python
-a_t = π(enc(s_t)) * action_scale   # O(d) forward pass
-```
-
-Used for all data collection after warmup. Replaces MPC for training-time action selection, making collection $\mathcal{O}(d)$ instead of $\mathcal{O}(H \cdot d \cdot \text{iters})$.
-
-### Sequential MPC (Continuous, benchmark)
-
-Parameterise $u \in \mathbb{R}^{H \times m}$, squash by tanh. Adam for `plan_iters` steps:
-
-```python
-for t in range(H):
-    z_t = dyn_step(z_t, B @ tanh(u[t]))
-# Terminal: Q(z_H, π(z_H)) instead of V(z_H)
-a_H  = π(z_H)
-loss = -Q(cat([z_H, a_H], dim=-1)).mean()
-```
-
-The $Q + \pi$ terminal makes the planner aware of the action-energy penalty accumulated along the path, unlike the old `V(z_H)` which was action-blind.
-
-### Block-Toeplitz GEMM (Continuous, benchmark)
+### Block-Toeplitz GEMM Value-Based (Continuous, primary)
 
 Replaces the sequential rollout with a single GEMM (see Section 7 for derivation). Objective:
 
-$$\mathcal{L}_\text{plan} = -\left[\sum_{t=0}^{H-1} \gamma^t R_\phi(z_t, u_t) + \gamma^H Q_\psi(z_H, \pi_\omega(z_H))\right]$$
+$$\max_{u_0,\ldots,u_{H-1}} \sum_{t=0}^{H-1} \gamma^t R_\phi(z_t, u_t) + \gamma^H Q_\psi(z_H, \pi_\omega(z_H))$$
 
-The `r_net` path costs provide a dense per-step signal within the horizon; the Q-terminal bootstraps the value beyond it. `cumulative=True/False` is replaced by this principled separation.
+The `r_net` path costs provide a dense per-step signal within the horizon; the Q-terminal bootstraps the value beyond it. Solved by `plan_iters` Adam steps on tanh-squashed logits $\ell \in \mathbb{R}^{H \times m}$.
+
+### Value-Free Closed-Form (Continuous)
+
+**Objective**: $\min_{u} \|z_H - z_\text{goal}\|^2$, where $z_\text{goal} = f_\theta(s_\text{goal})$ is the encoding of the target state.
+
+**Key insight**: unrolling the Koopman recursion to horizon $H$ gives a linear relationship between the action sequence and the terminal state:
+
+$$z_H = \underbrace{A^H z_0}_{z_H^\text{free}} + W_\text{reach}\, u_\text{flat}$$
+
+where the **reachability matrix** $W_\text{reach} \in \mathbb{R}^{d \times Hm}$ is the last $d$ rows of the Toeplitz matrix composed with $B$:
+
+$$W_\text{reach} = \mathbf{W}_\text{Toeplitz}[-d:]\;\cdot\;\text{block\_diag}(B,\ldots,B)$$
+
+This is a linear least-squares problem with **closed-form solution** (no Adam iterations required):
+
+$$u^* = \underbrace{(z_\text{goal} - A^H z_0)}_\text{residual at horizon} \cdot \text{pinv}(W_\text{reach})^\top$$
+
+The pseudo-inverse is computed once per call. Since $d=16$ and $H \cdot m = 10$ for Pendulum, $W_\text{reach}$ is $16 \times 10$ (overdetermined — the system cannot exactly reach all goal states in $H=10$ steps with 1-dim torque; the pseudo-inverse gives the minimum-norm torque sequence that minimises residual distance).
+
+**Timing**: 0.09 ms/step vs ~11 ms for gradient-based (100 Adam iterations). The closed-form exploits linearity fully — no iterations are possible or needed once the model is linear.
+
+### CEM Hybrid Planner (Continuous)
+
+Two-phase planner combining zero-order search with gradient polish:
+
+**Phase 1 — CEM (zero-order, inside `torch.no_grad()`)**: Sample $S$ action sequences from $\mathcal{N}(\mu, \sigma^2)$, score each by:
+$$J_s = \sum_{t=0}^{H-1} \gamma^t R_\phi(z_t^s, u_t^s) + \gamma^H Q_\psi(z_H^s, \pi_\omega(z_H^s))$$
+Update $\mu \leftarrow$ mean of top-$k$ elites, $\sigma \leftarrow$ std of top-$k$ elites. Repeat for `cem_iters` rounds.
+
+**Phase 2 — Gradient polish**: Warm-start logits at $\mu_\text{final}$ from CEM, then run `grad_iters` Adam steps on the same Toeplitz objective.
+
+**Why CEM finds what gradient descent misses**: from the hanging equilibrium, the gradient of $J$ w.r.t. $u$ is nearly zero (flat energy landscape). Gradient descent from $u=0$ is trapped. CEM samples globally — with high probability some sample commits to a large swing-up torque, which CEM identifies as an elite and shifts $\mu$ toward. Gradient polish then refines within this discovered basin.
+
+**Why CEM is faster than pure gradient**: Phase 1 runs inside `torch.no_grad()` (no backward pass). Phase 2 uses only `grad_iters=20` steps vs 100 for pure gradient. The batched GEMM over $S$ samples in Phase 1 is cheap relative to one backward pass.
+
+### Warm-Start Variants (Stateful)
+
+`CEMPlannerWarmStart` and `ToeplitzPlannerWarmStart` are stateful wrappers that implement **receding-horizon warm-starting**:
+
+After each timestep, the committed action $u_0$ is discarded and the remaining solution $[u_1, \ldots, u_H]$ is shifted forward by one step, zero-padded:
+
+$$\mu_\text{new} = [u_1, u_2, \ldots, u_{H-1}, 0]$$
+
+This warm-starts the next planning call with the previous solution's tail rather than zero-initialising. At evaluation time, both wrappers call `.reset()` at episode boundaries to discard stale warm-start state.
 
 ---
 
@@ -347,6 +363,14 @@ Write the $H$-step trajectory as a block equation. Let $X_t = B u_t \in \mathbb{
 $$\begin{bmatrix} z_1 \\ z_2 \\ \vdots \\ z_H \end{bmatrix} = \underbrace{\begin{bmatrix} A z_0 \\ A^2 z_0 \\ \vdots \\ A^H z_0 \end{bmatrix}}_{\mathbf{Z}_\text{IR}} + \underbrace{\begin{bmatrix} A^0 & 0 & \cdots & 0 \\ A^1 & A^0 & \cdots & 0 \\ \vdots & & \ddots & \vdots \\ A^{H-1} & \cdots & A^1 & A^0 \end{bmatrix}}_{\mathbf{W} \in \mathbb{R}^{Hd \times Hd}} \begin{bmatrix} X_0 \\ X_1 \\ \vdots \\ X_{H-1} \end{bmatrix}$$
 
 $\mathbf{W}$ is a **lower-triangular Block-Toeplitz** matrix: $\mathbf{W}_{ij} = A^{i-j}$ for $i \geq j$.
+
+### Reachability Matrix
+
+The terminal state $z_H$ depends only on the last block row of $\mathbf{W}$:
+
+$$z_H = A^H z_0 + W_\text{reach}\, u_\text{flat}, \qquad W_\text{reach} = \mathbf{W}[-d:] \cdot \text{block\_diag}(B, \ldots, B)$$
+
+$W_\text{reach} \in \mathbb{R}^{d \times Hm}$ is the **reachability matrix** for horizon $H$. If $d \leq Hm$ and $W_\text{reach}$ has full row rank, the system is reachable (any terminal latent state can be reached exactly). For Pendulum ($d=16$, $H=10$, $m=1$): $Hm=10 < d=16$ — underdetermined in terms of degrees of freedom, so exact reachability is not guaranteed; the pseudo-inverse gives the minimum-norm least-squares solution.
 
 ### Implementation
 
@@ -387,6 +411,22 @@ for _ in range(plan_iters):
     opt.step()
 ```
 
+**Value-free closed-form**:
+
+```python
+# W_reach: last d rows of W_toeplitz times block_diag(B,...,B)
+IB      = block_diag(*[B] * H)                     # [H*d, H*m]
+W_reach = W_toeplitz[-d:] @ IB                     # [d, H*m]
+
+# z_H_free = A^H z_0
+ZIR_H   = einsum('ij,nj->ni', A_stack[H], z0)      # [N, d]
+
+# Closed-form OLS
+residual = z_goal.expand(N, -1) - ZIR_H            # [N, d]
+u_flat   = residual @ pinv(W_reach).T               # [N, H*m]
+u0       = u_flat.reshape(N, H, m)[:, 0, :].clamp(-scale, scale)
+```
+
 ### Complexity
 
 | Quantity | Sequential planner | Toeplitz planner |
@@ -395,8 +435,9 @@ for _ in range(plan_iters):
 | Autograd graph depth | $\mathcal{O}(H)$ | $\mathcal{O}(1)$ |
 | GPU parallelism | Low (sequential deps) | High (cuBLAS GEMM) |
 | Precompute cost | None | $\mathcal{O}(H d^2)$, cached until $A$ changes |
+| Value-free | N/A | $\mathcal{O}(1)$ iterations (pinv, closed-form) |
 
-For Pendulum with $H=5$, $d=32$: GEMM is $160 \times 160$, fitting in L1 cache. Precompute is paid once and amortised over `plan_iters` steps. The autograd graph has depth $\mathcal{O}(1)$ since $\mathbf{W}$ and $\mathbf{Z}_\text{IR}$ are precomputed with `torch.no_grad()`.
+For Pendulum with $H=10$, $d=16$: GEMM is $160 \times 160$. Precompute is paid once and amortised over `plan_iters` steps. The autograd graph has depth $\mathcal{O}(1)$ since $\mathbf{W}$ and $\mathbf{Z}_\text{IR}$ are precomputed with `torch.no_grad()`.
 
 ---
 
@@ -431,19 +472,23 @@ Parameters: $\theta = 0.15$, $\mu = 0$, $\sigma = 0.2$, $\Delta t = 0.05$.
 | Environment | `Pendulum-v1` (Gymnasium) |
 | State | $[\cos\theta,\; \sin\theta,\; \dot\theta]$, dim 3 |
 | Action | Scalar torque $\in [-2, 2]$, dim 1 |
-| Latent dimension $d$ | 32 |
-| $A$ constraint | $O(d)$ via SVD Procrustes (hard on CUDA) |
+| Latent dimension $d$ | 16 |
+| $A$ constraint | $O(d)$ via SVD Procrustes (hard on CUDA, soft penalty on CPU/MPS) |
 | Encoder output | Raw (no normalisation) |
 | Discount $\gamma$ | 0.99 |
 | Network LR | $3 \times 10^{-4}$ |
 | Koopman LR scale | 0.5 ($A$, $B$ updated at $1.5 \times 10^{-4}$) |
-| Batch size | 256 |
+| Batch size | 512 |
 | Buffer size | 100,000 |
-| Warmup steps | 5,000 (pure random actions) |
-| Total steps | 30,000 (default) |
+| Warmup steps | 20,000 (pure random actions) |
+| Total steps | 50,000–100,000 |
 | EMA $\tau$ | 0.005 |
-| Exploration noise decay | Linear from 1.0 to 0.1 over 15,000 steps |
-| Reward scale | 10.0 (divide rewards before TD) |
+| Exploration noise | Decaying Gaussian, $1.0 \to 0.1$ |
+| Reward scale | 1.0 |
+| Plan horizon $H$ | 10 |
+| Plan iters | 100 (gradient-based); 10 CEM rounds + 20 grad polish |
+| CEM samples $S$ | 200 |
+| CEM elites $k$ | 20 |
 
 ### Training Loop
 
@@ -453,15 +498,13 @@ for step in 1..N_STEPS:
         action = random_action()
     else:
         action = π(enc(state)) * action_scale
-        action += noise * noise_scale   [OU or Gaussian, decaying]
+        action += noise * noise_scale   [Gaussian, decaying]
 
     next_state, reward, done = env.step(action)
     buffer.push(s, a, r, s', done)
 
-    if done: ou_noise.reset()
-
     if step > WARMUP and buffer.ready():
-        batch = buffer.sample(256)
+        batch = buffer.sample(512)
         z_src = encoder(s)
         z_tgt = target.encoder(s')            # stop-grad
 
@@ -475,57 +518,60 @@ for step in 1..N_STEPS:
         (L_koop + L_recon + L_r + L_q + L_ortho).backward()
         opt_world.step()
         target.update(agent, tau=0.005)
+        agent.invalidate_toeplitz_cache()
 
         # Actor backward
         L_pi = -q_net(z_src.detach(), π(z_src.detach()))
         L_pi.backward()
         opt_pi.step()
 
-    every 1000 steps:
-        print L_koop, L_r, L_q, L_pi, ret/20
-        if ret20 > best_ret: save_checkpoint(...)
-
-# End of training: three-variant benchmark
-benchmark("direct policy",    π(enc(s)))
-benchmark("sequential MPC",   plan_continuous_batch(Q+π terminal))
-benchmark("toeplitz MPC",     plan_toeplitz_batch(r_net path + Q+π terminal))
+# End of training: multi-planner benchmark (20 episodes each)
+benchmark("direct policy",         π(enc(s)))
+benchmark("toeplitz MPC",          act_plan_continuous(...))
+benchmark("grad value-free",       _value_free_act_batch(...))   # closed-form
+benchmark("toeplitz warm-start",   ToeplitzPlannerWarmStart(...))
+benchmark("CEM value-based",       CEMPlannerWarmStart(...))
+benchmark("CEM value-free",        CEMPlannerWarmStart(..., objective="value_free"))
 ```
 
 ### Best-Model Checkpointing
 
-Saved every 1,000 steps when rolling return over the last 20 episodes improves. Captures peak performance rather than final state, important because Koopman models can be unstable mid-training.
-
-### Logging
-
-Every 1,000 steps:
-```
-step  5000  noise=0.850  L_koop=0.0124  L_r=0.3217  L_q=0.0891  L_pi=-0.1240
-  ret/20= -850.3  ‖AᵀA-I‖²=0.0e+00  sps=1234
-  [best] ret/20=-732.4 → checkpoints/pendulum/kgp_pendulum_policy_s0_best.pt
-```
+Saved every 1,000 steps when rolling return over the last 20 episodes improves. Captures peak performance rather than final state. The benchmark at the end of training loads this best checkpoint before evaluation.
 
 ---
 
 ## 10. Experimental Results
 
-### Pendulum-v1: Pre-actor-critic (V-net baseline, 40k steps)
+### Planner Timing (Pendulum-v1, CPU, d=16, H=10)
 
-Config: `ortho_a=True`, OU noise, float64 planner (now removed — see Section 11).
+| Planner | Time/step |
+|---|---|
+| Direct policy $\pi$ | 0.04 ms |
+| Grad value-free (closed-form) | 0.09 ms |
+| Grad value-based (100 Adam iters) | ~23 ms |
+| CEM value-free (10×200 + 20 grad) | ~13 ms |
+| CEM value-based (10×200 + 20 grad) | ~28 ms |
 
-| Run | Planner | Seed | Best ret/20 | Solved? |
-|---|---|---|---|---|
-| toe_s3 | Toeplitz | 3 | $-180$ | Yes |
-| toe_s0 | Toeplitz | 0 | $-293$ | Yes |
-| toe_s2 | Toeplitz | 2 | $-352$ | Yes |
-| toe_s4 | Toeplitz | 4 | $-362$ | Yes |
-| seq_s0 | Sequential | 0 | $-369$ | Yes |
-| toe_s1 | Toeplitz | 1 | $-883$ | No |
+The closed-form value-free planner is ~250× faster than the gradient-based value-based planner, as it has zero Adam iterations.
 
-Success criterion: best rolling return $> -300$.
+### Orthogonality Ablation (Pendulum-v1, 100k steps, seed 0)
+
+Running with `ortho_a=False` (unconstrained $A$, no penalty):
+
+| Planner | Mean return (ortho_a=False) |
+|---|---|
+| Direct policy | -166.8 |
+| Grad value-free (closed-form) | -159.4 |
+| CEM value-free | -296.9 |
+| Toeplitz warm-start | -722.5 |
+| CEM value-based | -1035.5 |
+| **Toeplitz MPC (r_net+Q)** | **-1831.0** |
+
+$\|A^\top A - I\|_F^2$ stabilised at $\approx 2.5$ (vs $\leq 10^{-5}$ with constraint). The Toeplitz planner catastrophically fails because $A^k$ powers diverge, making imagined trajectories meaningless. Planners that call $A$ only once per step (policy, closed-form value-free via pseudo-inverse) are unaffected.
 
 ### GravityBasin: Best Config Results
 
-Config: `ortho_raw` (`ortho_a=True`, `no_normalize=True`). 40k steps.
+Config: `ortho_a=True`, `no_normalize=True`. 40k steps.
 
 - 100% greedy success rate
 - Mean episode length on success: 20.6 steps
@@ -536,49 +582,44 @@ Config: `ortho_raw` (`ortho_a=True`, `no_normalize=True`). 40k steps.
 
 ### Why a Separate r_net Instead of Q Alone?
 
-The Q-network is trained by bootstrapped TD, which means its targets depend on the current (evolving) policy and value estimates. During early training, these targets are unreliable — `L_q → ∞` was observed in the V-net baseline (0.005 → 4.27 over 50k steps).
+The Q-network is trained by bootstrapped TD, which means its targets depend on the current (evolving) policy and value estimates. During early training, these targets are unreliable.
 
 `r_net` is trained by **direct regression** against observed rewards. No bootstrap, no target network, no moving target. This decouples stable regression (r_net) from bootstrapped regression (Q), and gives the Toeplitz planner a reliable per-step signal that doesn't depend on Q convergence.
 
 ### Why Two Separate Optimisers?
 
-A single optimiser for the world model and actor would cause the actor loss $\mathcal{L}_\pi = -\mathbb{E}[Q(z, \pi(z))]$ to place gradients on Q-network parameters via the backward pass. These gradients would also contaminate `opt_world`'s Adam second-moment estimates for Q, creating an inconsistent training signal: Q is being pulled both toward Bellman targets (correct) and toward maximising $\pi$ outputs (incorrect).
-
-Two separate `Adam` instances with disjoint parameter sets prevent this entirely. `opt_pi` only updates `pi_net`; `opt_world` only updates the world model (encoder, decoder, r_net, q_net, A, B).
+A single optimiser for the world model and actor would cause the actor loss $\mathcal{L}_\pi = -\mathbb{E}[Q(z, \pi(z))]$ to place gradients on Q-network parameters via the backward pass. Two separate `Adam` instances with disjoint parameter sets prevent this entirely.
 
 ### Why No Target Network for r_net?
 
-Target networks exist to stabilise bootstrapped TD — the slow-moving target breaks the feedback loop between prediction and target. For `r_net`, the target is a fixed observed reward $r$, not a network output. There is no feedback loop to stabilise.
+Target networks exist to stabilise bootstrapped TD. For `r_net`, the target is a fixed observed reward $r$. There is no feedback loop to stabilise.
+
+### Why Orthogonality Is Necessary for the Toeplitz Planner
+
+The Toeplitz planner precomputes $A^0, \ldots, A^H$ and uses them to build $\mathbf{W}_\text{Toeplitz}$ and $W_\text{reach}$. If $A$ is not orthogonal, its largest singular value $\sigma_1 > 1$ causes $\|A^k\| \sim \sigma_1^k$ to grow exponentially. For $H=10$ and $\sigma_1 = 1.5$: $\sigma_1^{10} \approx 57$ — the imagined state $z_H$ is 57× larger than the real state. $R_\phi$ and $Q_\psi$, trained on states near the training distribution, produce garbage outputs on these out-of-distribution latent vectors.
+
+The direct policy and closed-form value-free planner are unaffected because they call $A$ at most once (through `dyn_step`), so a single factor of $\sigma_1$ does not cause catastrophic blowup.
+
+### The Natural Dynamics Gap
+
+Visualising the uncontrolled ($u=0$) system reveals that $z_{t+1} = Az_t$ does **not** accurately track the real zero-control pendulum trajectory. The latent divergence $\|z_t^\text{imag} - f_\theta(s_t^\text{real})\|$ grows monotonically from the first few steps.
+
+This is expected: $A$ is trained on the full controlled distribution, not the zero-control distribution specifically. The Koopman factorisation $z_{t+1} = Az_t + Bu_t$ does not cleanly separate autonomous dynamics from control-driven dynamics unless training specifically enforces this. In practice, $A$ encodes a mixture of dynamics that depends on the action distribution seen during training.
+
+This gap is one contributor to planning underperformance: imagined trajectories diverge from reality even when the controller applies actions close to the training distribution.
 
 ### Why Policy-Based Data Collection (Not MPC)?
 
-MPC-based data collection costs $\mathcal{O}(H \cdot d \cdot \text{plan\_iters})$ per step — effectively running the network $H \times \text{plan\_iters}$ times for each environment step. For $H=5$, `plan_iters=10`, $d=32$: that's 50 network forward passes per step.
-
-Direct policy `π(z)` costs one encoder call + one `pi_net` call, an $\mathcal{O}(d)$ operation. With exploration noise layered on top, the exploration-exploitation balance is controlled entirely by the noise schedule — no MPC quality is needed during data collection.
-
-MPC is retained for the **end-of-training benchmark**, where the goal is evaluation rather than speed.
-
-### V(z) Was Blind to Action Cost
-
-The old `V(z_H)` terminal objective in MPC cannot see the $0.001 u^2$ energy penalty accumulated along the trajectory. High-torque and low-torque trajectories that land at the same terminal latent state look identical to `V`. This meant the planner would freely use large torques to reach a high-value terminal state.
-
-`Q(z_H, π(z_H))` evaluates the value of the policy at the terminal state, which has learned to balance reward and action cost. Combined with `r_net` per-step costs in the Toeplitz planner, the full action-energy profile is now visible to MPC.
+MPC-based data collection costs $\mathcal{O}(H \cdot d \cdot \text{plan\_iters})$ per step. Direct policy `π(z)` costs one encoder call + one `pi_net` call. With decaying Gaussian exploration, the policy provides sufficient coverage. MPC is retained for the end-of-training benchmark.
 
 ### Encoder Gradient Isolation
 
-The encoder is updated **only** by $\mathcal{L}_\text{koop} + \mathcal{L}_\text{recon}$. All RL losses (`L_r`, `L_q`, `L_pi`) receive `z.detach()` — the encoder is never updated by value signals. This separates two distinct learning objectives:
-
-- The encoder learns a Koopman-consistent representation.
-- The value/policy heads learn to read that representation.
-
-Allowing RL losses to reshape the encoder corrupts the Koopman structure that the planner depends on. The `z.detach()` discipline is enforced at every RL loss computation in the trainer.
+The encoder is updated **only** by $\mathcal{L}_\text{koop} + \mathcal{L}_\text{recon}$. All RL losses (`L_r`, `L_q`, `L_pi`) receive `z.detach()`. Allowing RL losses to reshape the encoder corrupts the Koopman structure that the planner depends on.
 
 ### float64 in the Planner (Removed)
 
-Earlier versions used float64 inside the Toeplitz planner to address numerical noise in $\mathbf{W}_\text{Toeplitz} \mathbf{x}$. This was necessary when the terminal objective was `V(z)`, where small perturbations in $z_H$ directly corrupted the value signal.
-
-With the actor-critic upgrade, the terminal is `Q(z_H, π(z_H))`. Both Q and π are neural networks with bounded Lipschitz constants — small perturbations in $z_H$ produce bounded, smooth perturbations in the output. More fundamentally, $A \in O(d)$ has condition number 1 by definition, so $A^H$ is exactly isometric at any horizon. For $H \leq 20$ and $d = 32$, float32 numerical error in the GEMM is well within the noise floor of the neural networks. float64 kills GPU throughput with no benefit, and has been removed.
+With $A \in O(d)$, the condition number of $A^H$ is exactly 1 at any horizon. Float32 numerical error in the GEMM is well within the noise floor of the neural networks. Float64 kills GPU throughput with no benefit.
 
 ---
 
-*Updated 2026-03-20.*
+*Updated 2026-03-25.*

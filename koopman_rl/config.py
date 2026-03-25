@@ -58,6 +58,7 @@ class AlgoConfig:
     fix_a:               bool  = False
     no_normalize:        bool  = False
     lambda_ortho:        float = 1.0   # weight of soft ||AᵀA − I||²_F penalty (ortho_a=True only)
+    noise_z_std:         float = 0.0   # Gaussian noise std injected into z before A·z+Bu (0 = disabled)
     # Continuous control
     reward_scale:        float = 1.0   # divide rewards before TD
     n_envs:              int   = 1     # parallel envs for vectorised collection

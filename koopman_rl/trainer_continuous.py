@@ -194,7 +194,10 @@ def train_continuous(
                 z_dst_tgt = target.encoder(ns_b)
 
             # ── Koopman + reconstruction (gradient flows to encoder/A/B/decoder) ─
-            z_pred  = agent.dyn_step(z_src, a_norm @ agent.B.T)   # B trained in normalised units
+            z_src_dyn = z_src
+            if cfg.algo.noise_z_std > 0:
+                z_src_dyn = z_src + torch.randn_like(z_src) * cfg.algo.noise_z_std
+            z_pred  = agent.dyn_step(z_src_dyn, a_norm @ agent.B.T)   # B trained in normalised units
             L_koop  = ((z_pred - z_dst_tgt.detach()).pow(2)
                        .sum(dim=-1) * (1.0 - d_b)).mean()
             L_recon = (agent.decoder(z_src) - s_b).pow(2).mean()

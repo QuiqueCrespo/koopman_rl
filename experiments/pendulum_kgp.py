@@ -39,7 +39,7 @@ from koopman_rl.planner import plan_cem_gradient_batch, CEMPlannerWarmStart, Toe
 # ---------------------------------------------------------------------------
 ACTION_DIM       = 1
 ACTION_SCALE     = 2.0
-PLAN_HORIZON     = 10   # online planning (benchmark + data collection)
+PLAN_HORIZON     = 5   # online planning (benchmark + data collection)
 PLAN_ITERS       = 100   # online planning iterations
 VIZ_PLAN_HORIZON = 30   # offline viz: longer horizon so swing-up is visible
 VIZ_PLAN_ITERS   = 100   # offline viz: more iterations, no speed pressure
@@ -76,7 +76,7 @@ def make_pendulum_cfg(args) -> Config:
             d=16,
             lr=3e-4,
             ema_tau=0.005,
-            ortho_a=True,
+            ortho_a=False,
         ),
         buffer=BufferConfig(
             capacity=100_000,
@@ -90,6 +90,7 @@ def make_pendulum_cfg(args) -> Config:
             koop_lr_scale=1.0,
             reward_scale=10.0,
             n_envs=10,
+            noise_z_std=0.01,
         ),
         train=TrainConfig(
             n_steps=args.steps,
@@ -281,7 +282,7 @@ def _save_live_plot(episode_returns, koop_log, q_log=None, step=0, ortho_err=0.0
     Called via the on_viz callback from train_continuous.
     """
     fig, axes = plt.subplots(2, 3, figsize=(17, 9))
-    fig.suptitle(f"Pendulum Koopman (ortho_a=True, SVD) — step {step:,}"
+    fig.suptitle(f"Pendulum Koopman (ortho_a=False) — step {step:,}"
                  f"   ‖AᵀA−I‖²={ortho_err:.1e}", fontsize=12)
 
     # ── [0,0] Episode returns ─────────────────────────────────────────────────
@@ -753,25 +754,28 @@ def plot_policy_vs_planner(agent, cfg, max_steps=200):
         fontsize=11,
     )
 
-    # 2×3 grid: [Policy | Grad Value-Based | Grad Value-Free]
-    #           [CEM Value-Based | CEM Value-Free | Returns Bar]
-    fig_cmp, axes_cmp = plt.subplots(2, 3, figsize=(18, 12))
+    # 2×4 grid: [Policy | Grad Value-Based | Value-Free (closed-form) | Value-Free (grad)]
+    #           [CEM Value-Based | CEM Value-Free | Returns Bar | (empty)]
+    fig_cmp, axes_cmp = plt.subplots(2, 4, figsize=(24, 12))
     fig_cmp.suptitle(
         f"Planner Comparison — Value-Based vs Value-Free × Grad vs CEM  "
         f"(H={plan_horizon}  plan_iters={plan_iters}  cem={cem_iters}×{cem_samples}+{cem_grad}grad)",
         fontsize=11,
     )
-    ax_pol   = axes_cmp[0, 0]
-    ax_plan  = axes_cmp[0, 1]
-    ax_vfree = axes_cmp[0, 2]
-    ax_cem_v = axes_cmp[1, 0]
-    ax_cem_f = axes_cmp[1, 1]
-    ax_ret   = axes_cmp[1, 2]
+    ax_pol    = axes_cmp[0, 0]
+    ax_plan   = axes_cmp[0, 1]
+    ax_vfree  = axes_cmp[0, 2]   # closed-form
+    ax_vfg    = axes_cmp[0, 3]   # gradient descent
+    ax_cem_v  = axes_cmp[1, 0]
+    ax_cem_f  = axes_cmp[1, 1]
+    ax_ret    = axes_cmp[1, 2]
+    axes_cmp[1, 3].set_visible(False)
 
     traj_axes = [
         (ax_pol,   "Policy (π direct)"),
         (ax_plan,  "Grad Value-Based (r_net+Q)"),
-        (ax_vfree, "Grad Value-Free (‖z_H−z_goal‖²)"),
+        (ax_vfree, "Value-Free (‖z_H−z_goal‖² closed-form)"),
+        (ax_vfg,   f"Value-Free (‖z_H−z_goal‖² grad, {plan_iters} iters)"),
         (ax_cem_v, f"CEM Value-Based ({cem_iters}×{cem_samples}+{cem_grad}g)"),
         (ax_cem_f, f"CEM Value-Free  ({cem_iters}×{cem_samples}+{cem_grad}g)"),
     ]
@@ -787,8 +791,8 @@ def plot_policy_vs_planner(agent, cfg, max_steps=200):
         ax.set_xlabel("θ (rad)"); ax.set_ylabel("θ̇ (rad/s)")
         ax.set_title(title, fontsize=9)
 
-    pol_rets, plan_rets, vfree_rets, cem_val_rets, cem_vfree_rets = [], [], [], [], []
-    pol_ms,   plan_ms,  vfree_ms,  cem_val_ms,   cem_vfree_ms   = [], [], [], [], []
+    pol_rets, plan_rets, vfree_rets, vfg_rets, cem_val_rets, cem_vfree_rets = [], [], [], [], [], []
+    pol_ms,   plan_ms,  vfree_ms,  vfg_ms,   cem_val_ms,   cem_vfree_ms   = [], [], [], [], [], []
 
     for (label, s0), col in zip(starts, colors):
         # ── policy ───────────────────────────────────────────────────────────
@@ -813,7 +817,7 @@ def plot_policy_vs_planner(agent, cfg, max_steps=200):
         ax_plan.plot(th[-1], td[-1], "*", color=col, ms=9, zorder=5,
                      label=f"{label}  {plan_ret:.0f}")
 
-        # ── grad value-free (min ‖z_H − z_goal‖²) ───────────────────────────
+        # ── value-free closed-form ────────────────────────────────────────────
         vfree_states, vfree_ret, ms = _run_from(
             s0, lambda s: _value_free_act_batch(
                 agent, s[np.newaxis], z_goal,
@@ -824,6 +828,18 @@ def plot_policy_vs_planner(agent, cfg, max_steps=200):
         ax_vfree.plot(th[0], td[0], "o", color=col, ms=7, zorder=5)
         ax_vfree.plot(th[-1], td[-1], "*", color=col, ms=9, zorder=5,
                       label=f"{label}  {vfree_ret:.0f}")
+
+        # ── value-free gradient descent ───────────────────────────────────────
+        vfg_states, vfg_ret, ms = _run_from(
+            s0, lambda s: _value_free_grad_act_batch(
+                agent, s[np.newaxis], z_goal,
+                plan_horizon, plan_iters, gamma, action_scale)[0])
+        vfg_ms.append(ms)
+        th, td = _to_theta_thetadot(vfg_states)
+        ax_vfg.plot(th, td, color=col, lw=1.6, alpha=0.85)
+        ax_vfg.plot(th[0], td[0], "o", color=col, ms=7, zorder=5)
+        ax_vfg.plot(th[-1], td[-1], "*", color=col, ms=9, zorder=5,
+                    label=f"{label}  {vfg_ret:.0f}")
 
         # ── CEM value-based (warm-start) ─────────────────────────────────────
         cem_v_states, cem_val_ret, ms = _run_from(
@@ -851,14 +867,15 @@ def plot_policy_vs_planner(agent, cfg, max_steps=200):
                       label=f"{label}  {cem_vfree_ret:.0f}")
 
         pol_rets.append(pol_ret);       plan_rets.append(plan_ret)
-        vfree_rets.append(vfree_ret);   cem_val_rets.append(cem_val_ret)
-        cem_vfree_rets.append(cem_vfree_ret)
+        vfree_rets.append(vfree_ret);   vfg_rets.append(vfg_ret)
+        cem_val_rets.append(cem_val_ret); cem_vfree_rets.append(cem_vfree_ret)
 
     # Update trajectory panel titles with measured per-step planning time
     timing_labels = [
-        (ax_pol,   "Policy (π direct)",                  pol_ms),
-        (ax_plan,  "Grad value-based (r_net+Q)",         plan_ms),
-        (ax_vfree, "Grad value-free (‖z_H−z_goal‖²)",   vfree_ms),
+        (ax_pol,   "Policy (π direct)",                                    pol_ms),
+        (ax_plan,  "Grad value-based (r_net+Q)",                           plan_ms),
+        (ax_vfree, "Value-free (‖z_H−z_goal‖², closed-form)",              vfree_ms),
+        (ax_vfg,   f"Value-free (‖z_H−z_goal‖², grad {plan_iters} iters)", vfg_ms),
         (ax_cem_v, f"CEM value-based ({cem_iters}×{cem_samples}+{cem_grad}g)", cem_val_ms),
         (ax_cem_f, f"CEM value-free  ({cem_iters}×{cem_samples}+{cem_grad}g)", cem_vfree_ms),
     ]
@@ -871,12 +888,13 @@ def plot_policy_vs_planner(agent, cfg, max_steps=200):
 
     # ── return bar chart ──────────────────────────────────────────────────────
     x = np.arange(len(starts))
-    w = 0.14
-    ax_ret.bar(x - 2*w,   pol_rets,       w, label="Policy",            color="#4c8bc9", alpha=0.85)
-    ax_ret.bar(x - w,     plan_rets,      w, label="Grad value-based",  color="#ff7f0e", alpha=0.85)
-    ax_ret.bar(x,         vfree_rets,     w, label="Grad value-free",   color="#9467bd", alpha=0.85)
-    ax_ret.bar(x + w,     cem_val_rets,   w, label="CEM value-based",   color="#2ca02c", alpha=0.85)
-    ax_ret.bar(x + 2*w,   cem_vfree_rets, w, label="CEM value-free",    color="#d62728", alpha=0.85)
+    w = 0.12
+    ax_ret.bar(x - 2.5*w, pol_rets,       w, label="Policy",                  color="#4c8bc9", alpha=0.85)
+    ax_ret.bar(x - 1.5*w, plan_rets,      w, label="Grad value-based",        color="#ff7f0e", alpha=0.85)
+    ax_ret.bar(x - 0.5*w, vfree_rets,     w, label="VF closed-form",          color="#9467bd", alpha=0.85)
+    ax_ret.bar(x + 0.5*w, vfg_rets,       w, label="VF grad descent",         color="#8c564b", alpha=0.85)
+    ax_ret.bar(x + 1.5*w, cem_val_rets,   w, label="CEM value-based",         color="#2ca02c", alpha=0.85)
+    ax_ret.bar(x + 2.5*w, cem_vfree_rets, w, label="CEM value-free",          color="#d62728", alpha=0.85)
     ax_ret.axhline(-300, color="green", ls="--", lw=1.2, label="−300 target")
     ax_ret.set_xticks(x)
     ax_ret.set_xticklabels([l for l, _ in starts], rotation=20, ha="right", fontsize=8)
@@ -970,10 +988,15 @@ def _plan_objectives(agent, z0, z_goal, horizon, plan_iters, gamma):
     return val_curve, vfree_curve, u_val.detach(), u_jepa.detach()
 
 
-def _value_free_act_batch(agent, states: np.ndarray, z_goal,
+def _value_free_grad_act_batch(agent, states: np.ndarray, z_goal,
                     horizon, plan_iters, gamma, action_scale) -> np.ndarray:
     """
-    Value-free gradient planner: min ‖z_H − z_goal‖².  Same Toeplitz structure as value MPC.
+    Gradient-descent value-free planner: min_u ‖z_H − z_goal‖²
+
+    Same objective as the closed-form version, but solved with Adam on
+    tanh-squashed logits.  The tanh provides a soft action bound during
+    optimisation (unlike the closed-form which solves unbounded then clamps).
+
     Returns actions [N, action_dim] ∈ [-action_scale, action_scale].
     """
     device = z_goal.device
@@ -988,7 +1011,7 @@ def _value_free_act_batch(agent, states: np.ndarray, z_goal,
         ZIR = torch.einsum('kij,nj->nki', A_stack[1:], z0)  # [N, H, d]
 
     u_logits = torch.zeros(N, horizon, action_dim, device=device, requires_grad=True)
-    opt = optim.Adam([u_logits], lr=0.1)
+    opt = torch.optim.Adam([u_logits], lr=0.1)
 
     for _ in range(plan_iters):
         opt.zero_grad()
@@ -1003,6 +1026,56 @@ def _value_free_act_batch(agent, states: np.ndarray, z_goal,
 
     with torch.no_grad():
         return (torch.tanh(u_logits[:, 0, :]) * action_scale).cpu().numpy()
+
+
+def _value_free_act_batch(agent, states: np.ndarray, z_goal,
+                    horizon, plan_iters, gamma, action_scale) -> np.ndarray:
+    """
+    Closed-form value-free planner: min_u ‖z_H − z_goal‖²
+
+    Unrolling the Koopman recursion to horizon H gives:
+        z_H = A^H z_0  +  W_reach · u_flat
+
+    W_reach column k = γ^k · A^{H-1-k} · B  [d, H*action_dim]
+    The γ^k factor discounts action u_k consistently with the discounted
+    value objective: an action fired at step k costs γ^k in the discounted
+    system, so its effective contribution to z_H is scaled accordingly.
+    W_toeplitz stores undiscounted A^{i-j}; the gamma column-scaling is
+    applied here independently.
+
+    Closed-form OLS (no iterations):
+        u* = (z_goal − A^H z_0) @ pinv(W_reach).T
+
+    Returns actions [N, action_dim] ∈ [-action_scale, action_scale].
+    """
+    device = z_goal.device
+    d = agent.d
+    action_dim = agent.B.shape[1]
+    N = len(states)
+
+    with torch.no_grad():
+        z0 = agent.encoder(torch.tensor(states, dtype=torch.float32, device=device))
+        B = agent.B.detach()
+        W_toeplitz, _, A_stack = agent.get_toeplitz_cache(horizon, gamma)
+
+        # Free-flight terminal state: A^H z_0  [N, d]
+        ZIR_H = torch.einsum('ij,nj->ni', A_stack[horizon], z0)
+
+        # Reachability matrix with discount: W_reach[:,k] = γ^k · A^{H-1-k} · B
+        # W_toeplitz[-d:, k*d:(k+1)*d] = A^{H-1-k} (last block row, column-block k)
+        # Scale each d-wide column-block by γ^k → [H] discount weights
+        IB          = torch.block_diag(*[B] * horizon)                      # [H*d, H*action_dim]
+        gamma_cols  = (gamma ** torch.arange(horizon, device=device))        # [H]  γ^0 … γ^{H-1}
+        # Broadcast γ^k across the d rows of each column-block of IB
+        gamma_scale = gamma_cols.repeat_interleave(d)                        # [H*d]
+        IB_disc     = IB * gamma_scale.unsqueeze(1)                          # [H*d, H*action_dim]
+        W_reach     = W_toeplitz[-d:] @ IB_disc                             # [d, H*action_dim]
+
+        # Closed-form OLS: u* = residual @ pinv(W_reach).T
+        residual = z_goal.expand(N, -1) - ZIR_H             # [N, d]
+        u_flat   = residual @ torch.linalg.pinv(W_reach).T  # [N, H*action_dim]
+        u0 = u_flat.reshape(N, horizon, action_dim)[:, 0, :]
+        return u0.clamp(-action_scale, action_scale).cpu().numpy()
 
 
 def _cem_best_score(agent, z0, horizon, cem_iters, n_samples, n_elites, gamma):
@@ -1500,6 +1573,210 @@ def plot_model_rollout_accuracy(agent, cfg, n_steps: int = 200):
     print(f"  [viz] {path}")
 
 
+def plot_natural_dynamics(agent, cfg, n_steps: int = 300):
+    """
+    Compare the natural (uncontrolled, u=0) evolution of the real Pendulum-v1
+    against the imagined free-flight in learned latent space:
+
+        real env:      step with a=0 each time
+        latent model:  z_{t+1} = A z_t   (B·0 = 0)
+        decoded:       ŝ_t = decoder(z_t)
+
+    Since A ∈ O(d) the imagined latent norm is constant (sphere geodesic),
+    while the real pendulum is subject to gravity.  Their divergence reveals
+    whether the learnt A correctly encodes natural free-fall/swing dynamics.
+
+    4 rows × n_starts cols:
+      Row 0  — phase portrait (real vs imagined decoded), value grid background
+      Row 1  — θ and θ̇ time series (real vs imagined)
+      Row 2  — ‖ŝ − s‖ decoded state error + running mean
+      Row 3  — ‖enc(sₜ)‖ and ‖zₜ_imag‖ norms (left) + latent divergence (right)
+
+    Saves: output/viz/pendulum/natural_dynamics.png
+    """
+    agent.eval()
+    device = next(agent.parameters()).device
+
+    # Diverse starting states; θ=0 = upright (unstable), θ=π = hanging (stable)
+    starts = [
+        ("near-top ω=0",    np.array([np.cos(0.25),  np.sin(0.25),   0.0], np.float32)),
+        ("side (π/2) ω=0",  np.array([np.cos(np.pi/2), np.sin(np.pi/2), 0.0], np.float32)),
+        ("hanging ω=+4",    np.array([-1.0, 0.0,  4.0], np.float32)),
+        ("¾-up (2 rad) ω=0",np.array([np.cos(2.0),  np.sin(2.0),    0.0], np.float32)),
+    ]
+    n_starts = len(starts)
+
+    # ── collect real (u=0) and imagined (Az) rollouts ──────────────────────────
+    real_states_all  = []
+    imag_states_all  = []
+    z_norm_real_all  = []
+    z_norm_imag_all  = []
+    z_latent_err_all = []
+
+    for _, s0 in starts:
+        # real env with zero action
+        ev = gym.make("Pendulum-v1")
+        ev.reset()
+        ev.unwrapped.state = np.array([np.arctan2(float(s0[1]), float(s0[0])),
+                                       float(s0[2])])
+        s = s0.copy()
+        real_states = [s.copy()]
+        for _ in range(n_steps):
+            s, _, term, trunc, _ = ev.step(np.array([0.0], dtype=np.float32))
+            real_states.append(s.copy())
+            if term or trunc:
+                break
+        ev.close()
+        T = len(real_states) - 1
+
+        # latent free-flight: z_{t+1} = A z_t
+        with torch.no_grad():
+            real_s_t = torch.tensor(
+                np.array(real_states, dtype=np.float32), device=device)   # [T+1, 3]
+            z_enc_all = agent.encoder(real_s_t)                            # [T+1, d]
+            z_norms_real = z_enc_all.norm(dim=1).cpu().numpy()             # [T+1]
+
+            A = agent.A.detach()
+            z = z_enc_all[:1].clone()   # encode s0
+            imag_states  = [agent.decoder(z).cpu().numpy()[0].copy()]
+            z_norms_imag = [z.norm().item()]
+            z_lat_errs   = [0.0]
+
+            for t in range(T):
+                z = z @ A.T             # free-flight: u=0
+                s_hat = agent.decoder(z).cpu().numpy()[0]
+                imag_states.append(s_hat.copy())
+                z_norms_imag.append(z.norm().item())
+                z_lat_errs.append((z - z_enc_all[t + 1:t + 2]).norm().item())
+
+        real_states_all.append(np.array(real_states,  dtype=np.float32))
+        imag_states_all.append(np.array(imag_states,  dtype=np.float32))
+        z_norm_real_all.append(np.array(z_norms_real, dtype=np.float32))
+        z_norm_imag_all.append(np.array(z_norms_imag, dtype=np.float32))
+        z_latent_err_all.append(np.array(z_lat_errs,  dtype=np.float32))
+
+    # ── plot ───────────────────────────────────────────────────────────────────
+    fig, axes = plt.subplots(4, n_starts, figsize=(4.5 * n_starts, 15), squeeze=False)
+    fig.suptitle(
+        "Natural (Uncontrolled, u=0) Dynamics: Real Env vs Latent Free-Flight (z_{t+1}=Az_t)\n"
+        "blue = real env   orange = imagined (A z_t decoded)   "
+        "A ∈ O(d) ⟹ ‖z‖ preserved by model",
+        fontsize=10,
+    )
+
+    try:
+        vg = _value_grid(agent)
+    except Exception:
+        vg = None
+
+    for col, (label, _) in enumerate(starts):
+        rs  = real_states_all[col]   # [T+1, 3]
+        im  = imag_states_all[col]   # [T+1, 3]
+        T   = len(rs) - 1
+        ts  = np.arange(T + 1)
+
+        real_th = np.arctan2(rs[:, 1], rs[:, 0])
+        real_td = rs[:, 2]
+        imag_th = np.arctan2(im[:, 1], im[:, 0])
+        imag_td = im[:, 2]
+
+        # Row 0 — phase portrait
+        ax = axes[0, col]
+        if vg is not None:
+            _, _, V_grid = vg
+            ax.imshow(V_grid, extent=[-np.pi, np.pi, -8, 8],
+                      aspect="auto", origin="lower", cmap="viridis", alpha=0.35)
+        ax.plot(real_th, real_td, "o-", color="#4c8bc9", lw=1.5, ms=2.5,
+                alpha=0.9, label="real (u=0)")
+        ax.plot(imag_th, imag_td, "o-", color="#ff7f0e", lw=1.5, ms=2.5,
+                alpha=0.9, label="imag (Az)")
+        ax.plot(real_th[0], real_td[0], "gs", ms=8, zorder=6, label="start")
+        ax.plot(real_th[-1], real_td[-1], "b^", ms=7, zorder=6)
+        ax.plot(imag_th[-1], imag_td[-1], "r^", ms=7, zorder=6)
+        ax.axvline(0, color="white", lw=0.8, alpha=0.5)
+        ax.set_xlim(-np.pi, np.pi); ax.set_ylim(-8, 8)
+        ax.set_xticks([-np.pi, 0, np.pi])
+        ax.set_xticklabels(["-π", "0", "π"], fontsize=8)
+        ax.set_title(label, fontsize=9)
+        ax.set_xlabel("θ"); ax.set_ylabel("θ̇")
+        if col == 0:
+            ax.legend(fontsize=7, loc="upper left")
+        ax.grid(alpha=0.2)
+
+        # Row 1 — angle and angular velocity time series
+        ax = axes[1, col]
+        ax.plot(ts, real_th, color="#4c8bc9", lw=1.5, label="θ real")
+        ax.plot(ts, imag_th, color="#ff7f0e", lw=1.5, ls="--", label="θ imagined")
+        ax.fill_between(ts, real_th, imag_th, alpha=0.15, color="#d62728")
+        ax.set_ylabel("θ (rad)")
+        ax.set_xlabel("step")
+        ax.axhline(0, color="gray", lw=0.6, ls=":")
+        if col == 0:
+            ax.legend(fontsize=7)
+        ax.grid(alpha=0.3)
+
+        ax2 = ax.twinx()
+        ax2.plot(ts, real_td, color="#2ca02c", lw=1.2, alpha=0.6, label="θ̇ real")
+        ax2.plot(ts, imag_td, color="#9467bd", lw=1.2, ls="--", alpha=0.6,
+                 label="θ̇ imag")
+        ax2.set_ylabel("θ̇ (rad/s)", fontsize=7)
+        if col == n_starts - 1:
+            ax2.legend(fontsize=6, loc="upper right")
+
+        # Row 2 — decoded state error
+        ax = axes[2, col]
+        err = np.linalg.norm(rs - im, axis=1)   # [T+1]
+        ax.plot(ts, err, color="#d62728", lw=1.5, label="‖ŝ − s‖")
+        ax.fill_between(ts, err, alpha=0.2, color="#d62728")
+        ax.set_ylabel("‖ŝ − s‖", color="#d62728")
+        ax.set_xlabel("step")
+        ax3 = ax.twinx()
+        ax3.plot(ts, np.cumsum(err) / (ts + 1), color="#8c564b", lw=1.2,
+                 ls=":", label="running mean")
+        ax3.set_ylabel("running mean", fontsize=7)
+        div_steps = np.where(err > 0.5)[0]
+        if len(div_steps) > 0:
+            ax.axvline(div_steps[0], color="black", lw=1.2, ls="--",
+                       label=f"div t={div_steps[0]}")
+            ax.legend(fontsize=7)
+        ax.grid(alpha=0.3)
+
+        # Row 3 — latent norms + latent divergence
+        ax = axes[3, col]
+        z_nr = z_norm_real_all[col]
+        z_ni = z_norm_imag_all[col]
+        z_le = z_latent_err_all[col]
+
+        ax.plot(ts, z_nr, color="#4c8bc9", lw=1.5, label="‖enc(sₜ)‖  real")
+        ax.plot(ts, z_ni, color="#ff7f0e", lw=1.5, ls="--",
+                label="‖zₜ‖  imagined")
+        ax.set_ylabel("latent norm ‖z‖")
+        ax.set_xlabel("step")
+        if col == 0:
+            ax.legend(fontsize=7, loc="upper left")
+        ax.grid(alpha=0.3)
+
+        ax4 = ax.twinx()
+        ax4.plot(ts, z_le, color="#d62728", lw=1.5, alpha=0.85,
+                 label="‖z_imag − enc(s)‖")
+        ax4.fill_between(ts, z_le, alpha=0.12, color="#d62728")
+        ax4.set_ylabel("latent divergence", color="#d62728", fontsize=7)
+        lat_div_steps = np.where(z_le > 1.0)[0]
+        if len(lat_div_steps) > 0:
+            ax4.axvline(lat_div_steps[0], color="#d62728", lw=1.0, ls=":", alpha=0.7)
+            ax4.annotate(f"t={lat_div_steps[0]}",
+                         xy=(lat_div_steps[0], z_le[lat_div_steps[0]]),
+                         fontsize=6, color="#d62728", ha="left")
+        if col == n_starts - 1:
+            ax4.legend(fontsize=6, loc="lower right")
+
+    fig.tight_layout()
+    path = os.path.join(VIZ_DIR, "natural_dynamics.png")
+    fig.savefig(path, dpi=110, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  [viz] {path}")
+
+
 def plot_cem_diagnostics(agent, cfg):
     """
     Four diagnostic figures checking whether the CEM hybrid planner works correctly.
@@ -1983,7 +2260,7 @@ def plot_plan_convergence(agent, cfg):
     """
     2-row × 3-col grid:
     - Top row:    value-MPC objective J vs Adam iteration (one col per starting state)
-    - Bottom row: value-free ‖z_H − z_goal‖² vs Adam iteration (same cols)
+    - Bottom row: value-free Σ_t ‖z_t − z_goal‖² vs Adam iteration (same cols)
 
     Shows how quickly each planner converges and whether they plateau, oscillate,
     or diverge from their respective basins.
@@ -2054,7 +2331,7 @@ def plot_plan_convergence(agent, cfg):
         ax.plot(iters, vfree_curve, color=colors[i], lw=2, ls="--")
         ax.set_xlabel("Adam iteration")
         if i == 0:
-            ax.set_ylabel("‖z_H − z_goal‖²  [value-free]")
+            ax.set_ylabel("Σ_t ‖z_t − z_goal‖²  [value-free]")
         ax.grid(alpha=0.3)
 
     plt.tight_layout()
