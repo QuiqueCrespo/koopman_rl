@@ -49,6 +49,7 @@ def make_reacher_cfg(n_steps: int = 200_000) -> Config:
             lambda_ortho=1.0,
             koop_lr_scale=0.5,
             noise_z_std=0.05,
+            lambda_sigreg=1.0,
             no_graph=True,
         ),
         buffer=BufferConfig(

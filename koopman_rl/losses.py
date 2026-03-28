@@ -3,6 +3,7 @@ Loss functions for the gravity basin Koopman-RL agent.
 """
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 # Module-level defaults (backward compat)
@@ -13,6 +14,52 @@ LAMBDA_CONTRASTIVE  = 0.1    # repulsion hinge on unit sphere
 LAMBDA_ISOMETRIC    = 0.05   # latent ↔ physical distance alignment
 TAU_START           = 1.0    # AWR temperature start (soft pruning)
 TAU_END             = 0.1    # AWR temperature end   (hard pruning)
+
+
+class SIGReg(nn.Module):
+    """
+    Sketch Isotropic Gaussian Regularizer (Maes et al., LeWorldModel 2026).
+
+    Pushes the distribution of latent representations toward N(0, I) by
+    matching the empirical characteristic function (CF) of random 1D
+    projections to the target Gaussian CF  φ(t) = exp(-t²/2).
+
+    Uses the Epps–Pulley statistic: for each projection direction a and
+    quadrature knot t_k, the penalty is:
+        (E_B[cos(z·a · t_k)] − exp(−t_k²/2))²  +  (E_B[sin(z·a · t_k)])²
+
+    integrated over t ∈ [0, 3] with trapezoidal weights.
+
+    Args:
+        knots:    number of quadrature knots on [0, 3]  (default 17)
+        num_proj: number of random projection directions (default 1024)
+
+    Input:
+        z: (T, B, D)  — T time steps, B batch, D latent dim
+           Pass a (B, D) batch as z.unsqueeze(0) for single-step use.
+    """
+
+    def __init__(self, knots: int = 17, num_proj: int = 1024):
+        super().__init__()
+        self.num_proj = num_proj
+        t   = torch.linspace(0, 3, knots, dtype=torch.float32)
+        dt  = 3.0 / (knots - 1)
+        w   = torch.full((knots,), 2 * dt, dtype=torch.float32)
+        w[[0, -1]] = dt                          # trapezoidal endpoints
+        phi = torch.exp(-t.square() / 2.0)       # Gaussian CF: exp(-t²/2)
+        self.register_buffer("t",       t)
+        self.register_buffer("phi",     phi)
+        self.register_buffer("weights", w * phi)
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        # z: (T, B, D)
+        A = torch.randn(z.size(-1), self.num_proj, device=z.device)
+        A = A.div_(A.norm(p=2, dim=0))           # unit-norm columns
+        # projected scores: (T, B, num_proj, knots)
+        x_t = (z @ A).unsqueeze(-1) * self.t
+        # empirical CF vs Gaussian CF
+        err = (x_t.cos().mean(-3) - self.phi).square() + x_t.sin().mean(-3).square()
+        return (err @ self.weights).mean() * z.size(-2)   # scale by B
 
 
 def compute_v_targets(

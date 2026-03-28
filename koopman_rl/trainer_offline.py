@@ -20,6 +20,7 @@ from torch.utils.data import DataLoader
 
 from koopman_rl.model import KoopmanGradientPlanner, TargetNetwork
 from koopman_rl.config import Config
+from koopman_rl.losses import SIGReg
 
 
 def train_offline(
@@ -50,9 +51,9 @@ def train_offline(
     lr            = cfg.model.lr
     ema_tau       = cfg.model.ema_tau
     koop_lr_scale = cfg.algo.koop_lr_scale
-    lambda_koop   = cfg.algo.lambda_koop
-    lambda_ortho  = cfg.algo.lambda_ortho
-    action_scale  = cfg.env.action_scale
+    lambda_koop    = cfg.algo.lambda_koop
+    lambda_sigreg  = cfg.algo.lambda_sigreg
+    action_scale   = cfg.env.action_scale
     n_steps       = cfg.train.n_steps
     log_every     = cfg.train.log_every
     batch_size    = cfg.buffer.batch_size
@@ -72,8 +73,9 @@ def train_offline(
     agent.train()
 
     # Pre-allocated noise buffer (avoids repeated cuRAND allocs on GPU)
-    _z_noise = (torch.empty(batch_size, d, device=device)
-                if cfg.algo.noise_z_std > 0 else None)
+    _z_noise  = (torch.empty(batch_size, d, device=device)
+                 if cfg.algo.noise_z_std > 0 else None)
+    _sigreg   = SIGReg().to(device) if lambda_sigreg > 0 else None
 
     # Infinite iterator over the offline dataset
     def _inf(dl):
@@ -109,12 +111,12 @@ def train_offline(
         z_pred = agent.dyn_step(z_src_dyn, a_norm @ agent.B.T)
         L_koop = (z_pred - z_dst.detach()).pow(2).mean()
 
-        # Soft ortho penalty (CPU/MPS; zero on CUDA with hard SVD)
-        L_ortho = (agent.ortho_penalty()
-                   if (agent._ortho_a and not agent._use_hard_ortho)
-                   else torch.tensor(0.0, device=device))
+        # SIGReg: push z distribution toward N(0, I)
+        L_sigreg = (_sigreg(z_src.unsqueeze(0))
+                    if _sigreg is not None
+                    else torch.tensor(0.0, device=device))
 
-        loss = lambda_koop * L_koop + lambda_ortho * L_ortho
+        loss = lambda_koop * L_koop + lambda_sigreg * L_sigreg
 
         opt.zero_grad()
         loss.backward()
@@ -133,7 +135,7 @@ def train_offline(
             elapsed = time.time() - t0
             sps = log_every / elapsed
             print(f"  step {step:>8,}  L_koop={L_koop.item():.4f}"
-                  f"  L_ortho={L_ortho.item():.4f}"
+                  f"  L_sigreg={L_sigreg.item():.4f}"
                   f"  loss={loss_acc/log_every:.4f}"
                   f"  {sps:.1f} sps")
             loss_acc = 0.0

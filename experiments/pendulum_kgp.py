@@ -91,6 +91,8 @@ def make_pendulum_cfg(args) -> Config:
             reward_scale=10.0,
             n_envs=10,
             noise_z_std=0.01,
+            lambda_sigreg=1.0,
+            use_target_encoder=False,
         ),
         train=TrainConfig(
             n_steps=args.steps,

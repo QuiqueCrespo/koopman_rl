@@ -20,6 +20,7 @@ from koopman_rl.model import KoopmanGradientPlanner, TargetNetwork
 from koopman_rl.buffer import ContinuousReplayBuffer
 from koopman_rl.noise import OUNoise
 from koopman_rl.checkpoint import save_checkpoint, save_checkpoint_async
+from koopman_rl.losses import SIGReg
 
 # Number of evaluation episodes in the end-of-training planner benchmark
 _N_EVAL_PLAN = 20
@@ -66,8 +67,9 @@ def train_continuous(
     lr           = cfg.model.lr
     ema_tau      = cfg.model.ema_tau
     gamma        = cfg.algo.gamma
-    lambda_koop  = cfg.algo.lambda_koop
-    lambda_recon = cfg.algo.lambda_recon
+    lambda_koop   = cfg.algo.lambda_koop
+    lambda_recon  = cfg.algo.lambda_recon
+    lambda_sigreg = cfg.algo.lambda_sigreg
     koop_lr_scale = cfg.algo.koop_lr_scale
     reward_scale = cfg.algo.reward_scale
     n_envs       = cfg.algo.n_envs
@@ -121,8 +123,10 @@ def train_continuous(
 
     # Pre-allocated noise buffer — refilled in-place each step to avoid
     # repeated cuRAND state updates + allocations inside the hot loop.
-    _z_noise = (torch.empty(batch_size, d, device=device)
-                if cfg.algo.noise_z_std > 0 else None)
+    _z_noise  = (torch.empty(batch_size, d, device=device)
+                 if cfg.algo.noise_z_std > 0 else None)
+    _sigreg   = SIGReg().to(device) if lambda_sigreg > 0 else None
+    use_target_encoder = cfg.algo.use_target_encoder
 
     best_ckpt = os.path.join(ckpt_dir, f"kgp_{cfg.run_name}_best.pt")
 
@@ -140,7 +144,12 @@ def train_continuous(
     ep_returns      = np.zeros(n_envs, dtype=np.float32)
     episode_returns = []
     koop_log, q_log = [], []
-    recent_koop, recent_q, recent_r, recent_pi, recent_recon = [], [], [], [], []
+    _koop_acc  = torch.zeros(1, device=device)
+    _q_acc     = torch.zeros(1, device=device)
+    _r_acc     = torch.zeros(1, device=device)
+    _pi_acc    = torch.zeros(1, device=device)
+    _recon_acc = torch.zeros(1, device=device)
+    _n_acc = 0
     ou_list  = [OUNoise(action_dim) for _ in range(n_envs)] if ou_noise else None
     best_koop = float("inf")
     t0        = time.time()
@@ -195,8 +204,12 @@ def train_continuous(
 
             z_src  = agent.encode(s_b)
             a_norm = a_b / action_scale           # normalise to [-1, 1]; consistent with planner
-            with torch.no_grad():
-                z_dst_tgt = target.encoder(ns_b)
+
+            if use_target_encoder:
+                with torch.no_grad():
+                    z_dst_tgt = target.encoder(ns_b)
+            else:
+                z_dst_tgt = agent.encode(ns_b)   # online encoder; SIGReg prevents collapse
 
             # ── Koopman + reconstruction (gradient flows to encoder/A/B/decoder) ─
             z_src_dyn = z_src
@@ -207,10 +220,10 @@ def train_continuous(
                        .sum(dim=-1) * (1.0 - d_b)).mean()
             L_recon = (agent.decoder(z_src) - s_b).pow(2).mean()
 
-            # Soft ortho penalty (MPS/CPU fallback; never applied on CUDA)
-            L_ortho = (agent.ortho_penalty()
-                       if (agent._ortho_a and not agent._use_hard_ortho)
-                       else torch.tensor(0.0, device=device))
+            # SIGReg: push z distribution toward N(0, I)
+            L_sigreg = (_sigreg(z_src.unsqueeze(0))
+                        if _sigreg is not None
+                        else torch.tensor(0.0, device=device))
 
             # Stop-grad on z_src: RL losses must not reshape the Koopman encoder.
             z_det     = z_src.detach()
@@ -230,10 +243,10 @@ def train_continuous(
             L_q = (agent.q_net(za).squeeze(-1) - q_tgt).pow(2).mean()
 
             # ── World update (encoder + dynamics + r_net + q_net) ────────────
-            loss_world = lambda_koop * L_koop + lambda_recon * L_recon + L_r + L_q + L_ortho
+            recon_term = 0.0 if _sigreg is not None else lambda_recon * L_recon
+            loss_world = lambda_koop * L_koop + recon_term + L_r + L_q + lambda_sigreg * L_sigreg
             opt_world.zero_grad()
             loss_world.backward()
-            nn.utils.clip_grad_norm_(list(world_neural) + list(koop_params), max_norm=10.0)
             opt_world.step()
             agent.invalidate_toeplitz_cache()
             target.update(agent, tau=ema_tau)
@@ -243,24 +256,35 @@ def train_continuous(
             L_pi   = -agent.q_net(torch.cat([z_det, a_curr], -1)).squeeze(-1).mean()
             opt_pi.zero_grad()
             L_pi.backward()
-            nn.utils.clip_grad_norm_(agent.pi_net.parameters(), max_norm=10.0)
             opt_pi.step()
+
+            # Accumulate losses as plain floats — .item() deferred to log time
+            # to avoid per-step GPU→CPU sync.
+            _koop_acc  += L_koop.detach()
+            _q_acc     += L_q.detach()
+            _r_acc     += L_r.detach()
+            _pi_acc    += L_pi.detach()
+            _recon_acc += L_recon.detach()
+            _n_acc     += 1
 
         agent.eval()
 
-        recent_koop.append(L_koop.item())
-        recent_q.append(L_q.item())
-        recent_r.append(L_r.item())
-        recent_pi.append(L_pi.item())
-        recent_recon.append(L_recon.item())
-
         if env_step % 1_000 == 0:
             elapsed = time.time() - t0; t0 = time.time()
-            mk     = np.mean(recent_koop)
-            mq     = np.mean(recent_q)
-            mr     = np.mean(recent_r)
-            mpi    = np.mean(recent_pi)
-            mrecon = np.mean(recent_recon)
+            if _n_acc > 0:
+                mk     = (_koop_acc  / _n_acc).item()
+                mq     = (_q_acc     / _n_acc).item()
+                mr     = (_r_acc     / _n_acc).item()
+                mpi    = (_pi_acc    / _n_acc).item()
+                mrecon = (_recon_acc / _n_acc).item()
+            else:
+                mk = mq = mr = mpi = mrecon = float("nan")
+            _koop_acc  = torch.zeros(1, device=device)
+            _q_acc     = torch.zeros(1, device=device)
+            _r_acc     = torch.zeros(1, device=device)
+            _pi_acc    = torch.zeros(1, device=device)
+            _recon_acc = torch.zeros(1, device=device)
+            _n_acc = 0
             koop_log.append(mk); q_log.append(mq)
             recent20 = episode_returns[-20:] if episode_returns else []
             ret20    = np.mean(recent20) if recent20 else float("nan")
@@ -269,7 +293,6 @@ def train_continuous(
                   f"  L_koop={mk:.4f}  L_recon={mrecon:.4f}  L_r={mr:.4f}  L_q={mq:.4f}  L_pi={mpi:.4f}"
                   f"  ret/20={ret20:7.1f}"
                   f"  ‖AᵀA-I‖²={ortho_err:.1e}  sps={1000/elapsed:.0f}", flush=True)
-            recent_koop.clear(); recent_q.clear(); recent_r.clear(); recent_pi.clear(); recent_recon.clear()
 
             if mk < best_koop and env_step > warmup:
                 best_koop = mk

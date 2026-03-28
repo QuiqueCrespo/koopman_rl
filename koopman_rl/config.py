@@ -63,6 +63,8 @@ class AlgoConfig:
     lambda_ortho:        float = 1.0   # weight of soft ||AᵀA − I||²_F penalty (ortho_a=True only)
     noise_z_std:         float = 0.0   # Gaussian noise std injected into z before A·z+Bu (0 = disabled)
     utd_ratio:           int   = 1     # gradient steps per env step (update-to-data ratio)
+    lambda_sigreg:       float = 0.0   # weight of SIGReg (Sketch Isotropic Gaussian) loss (0 = disabled)
+    use_target_encoder:  bool  = True  # use EMA target encoder for z_dst (False → online encoder, rely on SIGReg)
     # Continuous control
     reward_scale:        float = 1.0   # divide rewards before TD
     n_envs:              int   = 1     # parallel envs for vectorised collection

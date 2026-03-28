@@ -224,8 +224,10 @@ class KoopmanGradientPlanner(nn.Module):
         key = (horizon, gamma)
         if key not in self._toeplitz_cache:
             device = next(self.parameters()).device
+            # Use A_eff = 2I - A to match the residual dyn_step formulation.
+            A_eff = 2 * torch.eye(self.d, device=device) - self.A.detach()
             self._toeplitz_cache[key] = _build_w_toeplitz(
-                self.A.detach(), horizon, gamma, device)
+                A_eff, horizon, gamma, device)
         return self._toeplitz_cache[key]
 
     def invalidate_toeplitz_cache(self) -> None:
@@ -251,13 +253,13 @@ class KoopmanGradientPlanner(nn.Module):
 
     def dyn_step(self, z: torch.Tensor, b_vec: torch.Tensor) -> torch.Tensor:
         """
-        One Koopman step: z' = A z + b_vec  
+        One Koopman step: z' = z + (I - A)z + b_vec  (residual form of Az + b_vec).
 
-
-        All callers (planner, train loop, act) go through here so switching
-        modes requires changing only the config, not any call site.
+        Equivalent to z' = (2I - A)z + b_vec.  The residual formulation is
+        friendlier to gradient-based planning: the skip connection z passes
+        gradients directly back through the trajectory without going through A.
         """
-        return z @ self.A.T + b_vec
+        return z + (z - z @ self.A.T) + b_vec
 
     def koop_parameters(self) -> list:
         """Parameter list for the Koopman optimizer group (A and B).
