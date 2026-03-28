@@ -19,6 +19,9 @@ class EnvConfig:
     step_penalty: float = -0.01
     action_scale: float = 1.0    # multiply tanh output → real action range
     continuous:   bool  = False  # continuous action space (vs discrete)
+    obs_type:     str   = "state"  # "state" | "pixels"
+    img_size:     int   = 64       # pixel H = W (square frames assumed)
+    img_channels: int   = 3
 
 
 @dataclass
@@ -59,6 +62,7 @@ class AlgoConfig:
     no_normalize:        bool  = False
     lambda_ortho:        float = 1.0   # weight of soft ||AᵀA − I||²_F penalty (ortho_a=True only)
     noise_z_std:         float = 0.0   # Gaussian noise std injected into z before A·z+Bu (0 = disabled)
+    utd_ratio:           int   = 1     # gradient steps per env step (update-to-data ratio)
     # Continuous control
     reward_scale:        float = 1.0   # divide rewards before TD
     n_envs:              int   = 1     # parallel envs for vectorised collection

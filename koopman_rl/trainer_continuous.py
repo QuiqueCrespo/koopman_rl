@@ -71,6 +71,7 @@ def train_continuous(
     koop_lr_scale = cfg.algo.koop_lr_scale
     reward_scale = cfg.algo.reward_scale
     n_envs       = cfg.algo.n_envs
+    utd_ratio    = cfg.algo.utd_ratio
     capacity     = cfg.buffer.capacity
     batch_size   = cfg.buffer.batch_size
     n_steps      = cfg.train.n_steps
@@ -117,6 +118,11 @@ def train_continuous(
     target.pi_net.eval()
     # Agent defaults to eval; switched to train() only for gradient steps.
     agent.eval()
+
+    # Pre-allocated noise buffer — refilled in-place each step to avoid
+    # repeated cuRAND state updates + allocations inside the hot loop.
+    _z_noise = (torch.empty(batch_size, d, device=device)
+                if cfg.algo.noise_z_std > 0 else None)
 
     best_ckpt = os.path.join(ckpt_dir, f"kgp_{cfg.run_name}_best.pt")
 
@@ -179,9 +185,8 @@ def train_continuous(
         if buf.size < batch_size:
             continue
 
-        # UTD ratio = 1: one gradient step per env step
         agent.train()
-        for _ in range(n_envs):
+        for _ in range(n_envs * utd_ratio):
             batch = buf.sample(batch_size)
             s_b, ns_b, a_b, r_b, d_b, t_b = (
                 torch.as_tensor(batch[k], device=device)
@@ -195,8 +200,8 @@ def train_continuous(
 
             # ── Koopman + reconstruction (gradient flows to encoder/A/B/decoder) ─
             z_src_dyn = z_src
-            if cfg.algo.noise_z_std > 0:
-                z_src_dyn = z_src + torch.randn_like(z_src) * cfg.algo.noise_z_std
+            if _z_noise is not None:
+                z_src_dyn = z_src + _z_noise.normal_(0, cfg.algo.noise_z_std)
             z_pred  = agent.dyn_step(z_src_dyn, a_norm @ agent.B.T)   # B trained in normalised units
             L_koop  = ((z_pred - z_dst_tgt.detach()).pow(2)
                        .sum(dim=-1) * (1.0 - d_b)).mean()

@@ -17,6 +17,7 @@ NOTE — ortho_a device dispatch:
 """
 
 import copy
+import math
 import random
 import numpy as np
 import torch
@@ -31,6 +32,24 @@ from koopman_rl.planner import (
     _build_w_toeplitz,
     plan_action_gumbel
 )
+
+def _oscillator_init(d: int) -> torch.Tensor:
+    """Skew-symmetric matrix with purely imaginary eigenvalues ±iβ_k, β_k ~ U[0.5, 1.5].
+    J = block_diag([[0,-β₁],[β₁,0]], ...) rotated by a random orthogonal Q: A = Q J Qᵀ.
+    Eigenvalues are purely imaginary → undamped oscillation inductive bias.
+    Each mode gets a distinct frequency; random Q mixes modes across all latent dims."""
+    if d % 2 != 0:
+        print("Warning: d is odd. One eigenvalue will be 0.")
+    J = torch.zeros(d, d)
+    betas = torch.rand(d // 2) + 0.5   # β_k ~ U[0.5, 1.5], no zeros
+    for i in range(d // 2):
+        idx = i * 2
+        b = betas[i].item()
+        J[idx,   idx+1] = -b
+        J[idx+1, idx  ] =  b
+    Q, _ = torch.linalg.qr(torch.randn(d, d))
+    return Q @ J @ Q.T
+
 
 # Module-level defaults (backward compat)
 N_ACTIONS = 4
@@ -181,14 +200,16 @@ class KoopmanGradientPlanner(nn.Module):
         self._use_hard_ortho = ortho_a and dev_type == "cuda"
 
         if self._use_hard_ortho:
-            # W ~ N(0, 1/d): generically distinct singular values → stable SVD backward.
-            # Identity / orthogonal init gives all σ=1 → 1/(σᵢ²−σⱼ²) = NaN.
+            # Oscillator init + small noise: noise breaks σᵢ = σⱼ degeneracy required
+            # for stable SVD backward (pure orthogonal init → all σ=1 → NaN gradient).
             self._A_layer = nn.Linear(d, d, bias=False)
-            nn.init.normal_(self._A_layer.weight, std=1.0 / (d ** 0.5))
+            with torch.no_grad():
+                osc = _oscillator_init(d)
+                self._A_layer.weight.copy_(osc + 0.01 * torch.randn(d, d))
             parametrize.register_parametrization(self._A_layer, 'weight', _SVDOrthogonal())
         else:
             # Unconstrained; soft penalty applied in loss when ortho_a=True.
-            self.A = nn.Parameter(torch.eye(d))
+            self.A = nn.Parameter(_oscillator_init(d))
 
         B = torch.empty(d, n_actions)
         nn.init.orthogonal_(B)
@@ -246,7 +267,7 @@ class KoopmanGradientPlanner(nn.Module):
 
     @classmethod
     def from_cfg(cls, cfg: Config, device=None) -> "KoopmanGradientPlanner":
-        return cls(
+        agent = cls(
             state_dim=cfg.env.state_dim,
             d=cfg.model.d,
             n_actions=cfg.env.n_actions,
@@ -255,6 +276,10 @@ class KoopmanGradientPlanner(nn.Module):
             device=device,
             continuous=cfg.env.continuous,
         )
+        if cfg.env.obs_type == "pixels":
+            from koopman_rl.visual_encoder import VisualEncoder
+            agent.encoder = VisualEncoder(cfg.env.img_channels, cfg.env.img_size, cfg.model.d)
+        return agent
 
     def encode(self, state: torch.Tensor) -> torch.Tensor:
         return self.encoder(state)

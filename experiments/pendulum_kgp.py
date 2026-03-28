@@ -991,10 +991,11 @@ def _plan_objectives(agent, z0, z_goal, horizon, plan_iters, gamma):
 def _value_free_grad_act_batch(agent, states: np.ndarray, z_goal,
                     horizon, plan_iters, gamma, action_scale) -> np.ndarray:
     """
-    Gradient-descent planner: min_u ‖z_H − z_goal‖² − Σ_t γ^t R_φ(z_t, u_t)
+    Gradient-descent value-free planner: min_u ‖z_H − z_goal‖²
 
-    Combines the terminal latent-distance objective with a discounted reward sum
-    from the learned R_φ.  Solved with Adam on tanh-squashed logits (soft bound).
+    Same objective as the closed-form version, but solved with Adam on
+    tanh-squashed logits.  The tanh provides a soft action bound during
+    optimisation (unlike the closed-form which solves unbounded then clamps).
 
     Returns actions [N, action_dim] ∈ [-action_scale, action_scale].
     """
